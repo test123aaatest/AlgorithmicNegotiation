@@ -92,6 +92,9 @@ CSV_FILE="${BASE_DIR}/ssh_algorithm_results_${TS}.csv"
 JSON_FILE="${BASE_DIR}/ssh_algorithm_results_${TS}.json"
 
 RESTORED=false
+# 恢复失败标记：任意恢复步骤失败即中止脚本并带非零退出码退出，
+# 避免 sshd 以测试配置继续运行导致后续测试全部失真。
+RESTORE_FAILED=false
 CLIENT_PID=""
 TEST_INDEX=0
 RUN_INDEX=0
@@ -118,6 +121,11 @@ INITIAL_SERVICE_KNOWN=false
 INITIAL_CRYPTO_POLICY=""
 CRYPTO_POLICY_CHANGED=false
 GENERATED_HOST_KEYS=()
+# 记录本测试覆盖前已存在的原文件备份（RESTORE_HELPER / systemd drop-in 等），
+# 恢复时原样还原，避免覆盖/删除管理员已有配置。
+PREEXISTING_BACKUPS=()
+# 本测试创建的所有临时文件清单，恢复时精确删除，避免按 glob 误删其它进程文件。
+TRACKED_TMP_FILES=()
 AUTO_AUTH_KEY_ADDED=false
 RESTORE_HELPER="/usr/local/sbin/ssh-algo-unified-restore"
 PID_FILE="/var/run/ssh-algo-unified.pid"
@@ -214,6 +222,10 @@ for arg in "$@"; do
             ;;
         --port=*)
             PORT="${arg#--port=}"
+            if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+                echo "错误：--port 必须是 1-65535 的纯数字（收到: '$PORT'）" >&2
+                exit 1
+            fi
             ;;
         -h|--help)
             cat <<'EOF'
@@ -337,12 +349,13 @@ detect_env() {
     fi
 
     # sshd -V 在 OpenSSH < 7.2 上不支持（如 CentOS 6 / OpenSSH 5.3），
-    # 会导致 SSHD_VER_MAJOR 为空。此时回退到 ssh 客户端版本号——
-    # 同一系统上客户端和服务端版本通常一致。
-    if [[ -z "$SSHD_VER_MAJOR" ]] && [[ -n "$SSH_VER_MAJOR" ]]; then
+    # 会导致 SSHD_VER_MAJOR 为空。此时仅在典型的 SysV/CentOS6 场景下回退到
+    # 客户端版本号（同一系统上客户端和服务端版本通常一致）；若系统是
+    # systemd 现代环境却拿不到 sshd 版本，不回退，避免用客户端版本误判。
+    if [[ -z "$SSHD_VER_MAJOR" ]] && [[ -n "$SSH_VER_MAJOR" ]] && [[ "$INIT" == "sysv/service" ]]; then
         SSHD_VER_MAJOR="$SSH_VER_MAJOR"
         SSHD_VER_MINOR="${SSH_VER_MINOR:-0}"
-        env_log "sshd -V 不可用（OpenSSH < 7.2），回退到客户端版本: ${SSH_VER}"
+        env_log "sshd -V 不可用（OpenSSH < 7.2），在 SysV 环境回退到客户端版本: ${SSH_VER}"
     fi
 
     # 判定 init 系统的关键：systemctl 命令存在并不代表 systemd 真正可用。
@@ -619,7 +632,7 @@ add_test() {
     # 被接受（无副作用，不重启不安装）。返回：0=可接受 1=明确不接受
     # 2=无法探测（复用发行版/版本黑名单作兜底，避免硬编码误杀厂商 backport）。
     if [[ "$7" == 2 ]]; then
-        server_candidate_supported "$2" "$3" "$4" "$5" 2
+        server_candidate_supported "$2" "$3" "$4" "$5"
         local src=$?
         if (( src == 1 )); then
             FILTERED_TESTS=$((FILTERED_TESTS + 1))
@@ -1013,6 +1026,9 @@ if ! detect_env; then
 fi
 
 load_default_effective_algorithms >/dev/null 2>&1 || true
+# crypto policy 放松须在动态探测/组合过滤之前执行（否则被 DEFAULT/FUTURE 屏蔽
+# 的算法会被 server_algo_supported 提前过滤掉）；prepare_crypto_policy 幂等。
+prepare_crypto_policy
 load_worker_algorithms
 
 case "$PROFILE" in
@@ -1023,7 +1039,7 @@ case "$PROFILE" in
         # SSH-1 探测（ssh1_binary_supported）需要 /etc/ssh/ssh_host_key 存在，
         # 但 prepare_host_keys() 在 load_centos6_tests() 之后才执行。
         # 因此先确保 rsa1 host key 存在，使探测配置的 HostKey 指向有效文件。
-        if [[ ! -f /etc/ssh/ssh_host_key ]]; then
+        if [[ ! -f /etc/ssh/ssh_host_key ]] && ! $LIST_ONLY; then
             if ssh-keygen -q -t rsa1 -f /etc/ssh/ssh_host_key -N "" >/dev/null 2>&1; then
                 GENERATED_HOST_KEYS+=("/etc/ssh/ssh_host_key")
                 env_log "SSH-1 探测前预生成 HostKey: /etc/ssh/ssh_host_key"
@@ -1221,7 +1237,7 @@ verify_restored_state() {
         fi
     fi
 
-    if find /tmp -maxdepth 1 -type f \( -name 'algo_client.*' -o -name 'algo_sshd_t.*' \) -print -quit 2>/dev/null | grep -q .; then
+    if find /tmp -maxdepth 1 -type f \( -name 'algo_client.$$.*' -o -name 'algo_sshd_t.$$.*' \) -print -quit 2>/dev/null | grep -q .; then
         temp_ok=false
         log "[恢复验证] temporary files: FAIL（发现测试临时文件）"
     else
@@ -1262,14 +1278,21 @@ restore_all() {
     rm -f "$AUTO_KEY" "$AUTO_PUB" "$AUTO_SSH1_KEY" "$AUTO_SSH1_PUB"
 
     # 恢复测试前的 sshd_config；整个恢复过程使用同目录临时文件 + mv，避免半写状态。
+    # 若测试期间管理员/配置管理工具已修改 sshd_config（不含测试 marker），
+    # 不覆盖其修改，记录警告后保留现状。
     if [[ -f "$BACKUP_FILE" ]]; then
-        local restore_tmp
-        restore_tmp="$(mktemp "${SSHD_CONFIG}.restore.XXXXXX")"
-        if cp -a "$BACKUP_FILE" "$restore_tmp" && mv -f "$restore_tmp" "$SSHD_CONFIG"; then
-            log "[恢复] sshd_config 已恢复"
+        if grep -qF 'ALGO_TEST_ACTIVE_MARKER_DO_NOT_EDIT' "$SSHD_CONFIG" 2>/dev/null; then
+            local restore_tmp
+            restore_tmp="$(mktemp "${SSHD_CONFIG}.restore.XXXXXX")"
+            if cp -a "$BACKUP_FILE" "$restore_tmp" && mv -f "$restore_tmp" "$SSHD_CONFIG"; then
+                log "[恢复] sshd_config 已恢复"
+            else
+                log "[恢复] ERROR：sshd_config 恢复失败"
+                RESTORE_FAILED=true
+                rm -f "$restore_tmp"
+            fi
         else
-            log "[恢复] ERROR：sshd_config 恢复失败"
-            rm -f "$restore_tmp"
+            log "[恢复] WARNING：sshd_config 已被外部修改（不含测试 marker），跳过恢复以避免覆盖外部修改"
         fi
     fi
 
@@ -1294,11 +1317,15 @@ restore_all() {
         fi
     fi
 
-    rm -f /tmp/algo_client.* /tmp/algo_sshd_t.*
-    # 清理 make_test_config_from_backup / test_one / restore_after_test / restore_all
-    # 在 /etc/ssh/ 下创建的临时文件（sshd_config.XXXXXX / .restore.XXXXXX / .recover.XXXXXX），
-    # 避免 kill -9 后残留。
-    rm -f /etc/ssh/sshd_config.?????? /etc/ssh/sshd_config.restore.?????? /etc/ssh/sshd_config.recover.?????? 2>/dev/null || true
+    rm -f /tmp/algo_client.$$.* /tmp/algo_sshd_t.$$.*
+    # 清理本脚本在 /etc/ssh/ 下创建的测试临时文件。只删除带 ALGO_TEST
+    # marker、确属本流程生成的文件（而非任意 sshd_config.* 通配），
+    # 避免误删其它进程/管理员文件；也兼容 kill -9 后由恢复钩子清理。
+    if command -v grep >/dev/null 2>&1; then
+        grep -lF 'ALGO_TEST_ACTIVE_MARKER' \
+            /etc/ssh/sshd_config.?????? /etc/ssh/sshd_config.restore.?????? \
+            /etc/ssh/sshd_config.recover.?????? 2>/dev/null | xargs -r rm -f -- 2>/dev/null || true
+    fi
 
     # 恢复测试前服务运行状态；不因为脚本测试过程中重启过就改变原状态。
     if $INITIAL_SERVICE_KNOWN; then
@@ -1317,6 +1344,22 @@ restore_all() {
             log "[恢复] 服务状态：恢复为测试前停止状态"
         fi
     fi
+
+    # 还原本测试覆盖前备份的管理员原文件（RESTORE_HELPER / systemd drop-in 等）。
+    local _pair _orig _bakbak
+    for _pair in "${PREEXISTING_BACKUPS[@]:-}"; do
+        _orig="${_pair%%|*}"
+        _bakbak="${_pair#*|}"
+        if [[ -n "$_orig" && -f "$_bakbak" ]]; then
+            if mv -f "$_bakbak" "$_orig" 2>/dev/null; then
+                log "[恢复] 已还原被覆盖路径：$_orig"
+            else
+                log "[恢复] ERROR：还原 $_orig 失败"
+                RESTORE_FAILED=true
+            fi
+        fi
+    done
+    PREEXISTING_BACKUPS=()
 
     # 删除本次运行创建的崩溃自愈钩子和 PID。
     rm -f "$PID_FILE"
@@ -1345,11 +1388,32 @@ restore_all() {
     fi
     release_lock
     log "[恢复] 临时文件和测试客户端已清理"
+    if $RESTORE_FAILED; then
+        log "[恢复] ERROR：存在恢复失败项；为避免 sshd 停留在测试配置上，脚本以非零码退出。"
+        exit 1
+    fi
     log "[恢复] 完成"
 }
 
+backup_preexisting() {
+    # 若目标路径已存在且不是本测试之前创建的（不含 ALGO_TEST marker），
+    # 备份到 STATE_DIR，恢复时通过 PREEXISTING_BACKUPS 还原，避免覆盖管理员原有文件。
+    local f="$1"
+    [[ -n "$f" && -e "$f" ]] || return 0
+    if grep -qF 'ALGO_TEST' "$f" 2>/dev/null; then
+        return 0   # 是本测试的残留，直接可覆盖/删除
+    fi
+    local bak="$STATE_DIR/preexisting_$(basename "$f").$$"
+    if cp -a "$f" "$bak" 2>/dev/null; then
+        PREEXISTING_BACKUPS+=("$f|$bak")
+        env_log "备份被覆盖路径（恢复时还原）: $f -> $bak"
+    fi
+}
+
 install_recovery() {
-    echo "$$" > "$PID_FILE" || die "无法创建 PID 文件：$PID_FILE"
+    # PID 文件写入 2 字段：PID 和进程启动时间（/proc/[pid]/stat 第 22 字段），
+    # 供崩溃自愈 helper 比对，避免 PID 被其它进程复用后误判“原测试仍在运行”。
+    echo "$$ $(awk '{print $22}' /proc/$$/stat 2>/dev/null || echo 0)" > "$PID_FILE" || die "无法创建 PID 文件：$PID_FILE"
 
     if [[ "$INIT" == "systemd" && "$SERVICE" != "unknown" ]]; then
         SYSTEMD_DROPIN_DIR="/etc/systemd/system/${SERVICE}.service.d"
@@ -1374,7 +1438,19 @@ if [[ -f "\$BACKUP" ]] && grep -qF "\$MARKER" "\$CONFIG" 2>/dev/null; then
         restore=true
     else
         pid="\$(cat "\$PIDFILE" 2>/dev/null || true)"
-        if [[ -z "\$pid" ]] || ! kill -0 "\$pid" 2>/dev/null; then restore=true; fi
+        # PID 文件为 "PID STARTTIME" 两字段；比对 /proc/[pid]/stat 第 22 字段，
+        # 防止 PID 被其它进程复用后误判“原测试仍在运行”。
+        if [[ -z "\$pid" ]]; then restore=true
+        else
+            pid_start="\$(printf '%s' "\$pid" | awk '{print \$2}')"
+            pid_num="\$(printf '%s' "\$pid" | awk '{print \$1}')"
+            if [[ -z "\$pid_num" ]]; then restore=true
+            elif ! kill -0 "\$pid_num" 2>/dev/null; then restore=true
+            else
+                cur_start="\$(awk '{print \$22}' "/proc/\$pid_num/stat" 2>/dev/null || echo 0)"
+                if [[ -z "\$pid_start" || "\$pid_start" != "\$cur_start" ]]; then restore=true; fi
+            fi
+        fi
     fi
     if \$restore; then
         t="\$(mktemp "\${CONFIG}.recover.XXXXXX")"
@@ -1385,8 +1461,10 @@ if [[ -f "\$BACKUP" ]] && grep -qF "\$MARKER" "\$CONFIG" 2>/dev/null; then
             rmdir "\$DROPIN_DIR" 2>/dev/null || true
             # 清理可能残留的锁目录，避免后续运行报"已有实例正在运行"
             rm -rf /var/run/ssh-algo-unified.lock 2>/dev/null || true
-            # 清理 /etc/ssh/ 下的测试临时文件
-            rm -f /etc/ssh/sshd_config.?????? /etc/ssh/sshd_config.restore.?????? /etc/ssh/sshd_config.recover.?????? 2>/dev/null || true
+            # 清理 /etc/ssh/ 下的测试临时文件（仅删带 ALGO_TEST marker 的）
+            grep -lF 'ALGO_TEST_ACTIVE_MARKER_DO_NOT_EDIT' \
+                /etc/ssh/sshd_config.?????? /etc/ssh/sshd_config.restore.?????? \
+                /etc/ssh/sshd_config.recover.?????? 2>/dev/null | xargs -r rm -f -- 2>/dev/null || true
             systemctl daemon-reload >/dev/null 2>&1 || true
             systemctl restart "\$SERVICE" >/dev/null 2>&1 || true
         else
@@ -1397,8 +1475,10 @@ fi
 exit 0
 EOF
         chmod 755 "$helper_tmp"
+        backup_preexisting "$RESTORE_HELPER"
         mv -f "$helper_tmp" "$RESTORE_HELPER"
         mkdir -p "$SYSTEMD_DROPIN_DIR"
+        backup_preexisting "$SYSTEMD_DROPIN_FILE"
         dropin_tmp="$(mktemp "${SYSTEMD_DROPIN_FILE}.XXXXXX")" || die "无法创建 systemd recovery drop-in"
         cat > "$dropin_tmp" <<EOF
 # SSH algorithm unified test temporary recovery hook
@@ -1437,6 +1517,7 @@ fi
 exit 0
 EOF
         chmod 755 "${RESTORE_HELPER}.tmp"
+        backup_preexisting "$RESTORE_HELPER"
         mv -f "${RESTORE_HELPER}.tmp" "$RESTORE_HELPER"
         crontab "$cron_tmp" 2>/dev/null || true
         rm -f "$cron_tmp"
@@ -1705,6 +1786,22 @@ detect_log_file() {
     printf '%s\n' ""
 }
 
+file_size() {
+    # 跨平台获取文件字节数：
+    #   GNU/Linux:  stat -c %s
+    #   BSD/macOS:  stat -f %z
+    #   兜底:       wc -c
+    local f="$1"
+    [[ -f "$f" ]] || { printf '0\n'; return 0; }
+    if stat -c %s "$f" >/dev/null 2>&1; then
+        stat -c %s "$f" 2>/dev/null
+    elif stat -f %z "$f" >/dev/null 2>&1; then
+        stat -f %z "$f" 2>/dev/null
+    else
+        wc -c < "$f" 2>/dev/null | tr -d ' '
+    fi
+}
+
 read_log_delta() {
     local file="$1" size="$2"
     if [[ "$file" == JOURNAL:* ]]; then
@@ -1714,7 +1811,7 @@ read_log_delta() {
     fi
     [[ -f "$file" ]] || return 0
     local cur
-    cur="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+    cur="$(file_size "$file")"
     if (( cur >= size )); then
         tail -c +"$((size + 1))" "$file" 2>/dev/null || true
     else
@@ -1757,7 +1854,7 @@ wait_for_manual_client() {
             # 只对本次新增的日志片段判断；把 size 推进到文件当前大小，
             # 避免下一轮重复读同一段而无限累积同内容，或旧连接反复命中。
             if printf '%s\n' "$d" | grep -qiE \
-                'Connection from|kex: |server->client|Accepted password|Accepted publickey|PAM: authentication'; then
+                'kex: |server->client|Offering |Accepted password|Accepted publickey|PAM: authentication|kex_exchange_identification'; then
                 acc+="$d"
                 log "已检测到外部客户端连接日志，自动进入下一项。"
                 printf '%s' "$acc"
@@ -1765,7 +1862,7 @@ wait_for_manual_client() {
             fi
             acc+="$d"
         fi
-        cur_size="$(stat -c %s "$file" 2>/dev/null || echo "$size")"
+        cur_size="$(file_size "$file")"
         if [[ "$file" != JOURNAL:* && "$cur_size" != "$size" ]]; then
             size="$cur_size"
         fi
@@ -1951,7 +2048,7 @@ make_test_config_from_backup() {
         /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]+[Aa][Ll][Ll]([[:space:]]|$)/ { in_match=0; print; next }
         /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh]([[:space:]]|$)/ { in_match=1 }
         {
-            if (!in_match && $0 ~ /^[[:space:]]*(Port|ListenAddress|Protocol|KexAlgorithms|Ciphers|Cipher|MACs|HostKeyAlgorithms|HostKey|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|UsePAM|LogLevel|Compression|Include)[[:space:]]+/) {
+            if (!in_match && $0 ~ /^[[:space:]]*(Port|ListenAddress|Protocol|KexAlgorithms|Ciphers|Cipher|MACs|HostKeyAlgorithms|HostKey|LogLevel|Compression|Include)[[:space:]]+/) {
                 print "# UNIFIED_TEST_COMMENTED: " $0
             } else {
                 print
@@ -2097,14 +2194,17 @@ restore_after_test() {
     local skip_restart="${2:-false}"
     local restore_tmp=""
 
-    if [[ -f "$BACKUP_FILE" ]]; then
+    if [[ -f "$BACKUP_FILE" ]] && grep -qF 'ALGO_TEST_ACTIVE_MARKER_DO_NOT_EDIT' "$SSHD_CONFIG" 2>/dev/null; then
         restore_tmp="$(mktemp "${SSHD_CONFIG}.restore.XXXXXX" 2>/dev/null || true)"
         if [[ -n "$restore_tmp" ]] && cp -a "$BACKUP_FILE" "$restore_tmp" && mv -f "$restore_tmp" "$SSHD_CONFIG"; then
             log "[恢复] $reason：sshd_config 已恢复"
         else
             log "[恢复] ERROR：$reason：sshd_config 恢复失败"
+            RESTORE_FAILED=true
             [[ -n "$restore_tmp" ]] && rm -f "$restore_tmp"
         fi
+    elif [[ -f "$BACKUP_FILE" ]]; then
+        log "[恢复] WARNING：$reason：sshd_config 已被外部修改（不含测试 marker），跳过恢复以避免覆盖外部修改"
     fi
 
     # 仅在配置确实被 mv 替换后才需要重启服务恢复；
@@ -2121,7 +2221,7 @@ restore_after_test() {
         fi
     fi
 
-    rm -f /tmp/algo_client.* /tmp/algo_sshd_t.*
+    rm -f /tmp/algo_client.$$.* /tmp/algo_sshd_t.$$.*
 }
 
 record_result() {
@@ -2198,11 +2298,13 @@ test_one() {
     fi
 
     # 客户端完全不支持 SSH-1 时，不进入 SSH-1 协商测试；这属于客户端能力限制，不能判为服务端算法 FAIL。
-    if [[ "$proto" == "1" && ! "$SSH_VER" =~ ^5\. ]]; then
+    # 仅自动模式做此判断：自动模式由本机 ssh 发起连接，其版本决定能否协商 SSH-1。
+    # 手动模式由外部客户端（如 CF Worker）连接，客户端能力未知，不做预判，交真实协商判断。
+    if $AUTO && [[ "$proto" == "1" && ! "$SSH_VER" =~ ^5\. ]]; then
         NR="SKIP"
         AR="NOT_TESTED"
         CR="CLIENT_REJECTED"
-        reason="当前 OpenSSH 客户端版本(${SSH_VER:-unknown})不支持 SSH-1；SSH-1 测试仅适用于 CentOS 6/OpenSSH 5.x 环境"
+        reason="本机 ssh 客户端版本(${SSH_VER:-unknown})不支持 SSH-1；仅自动模式适用此判断（手动模式由外部客户端连接，不做预判）"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "" "" "" "" "$NR" "$AR" "$CR" "$reason"
         log "SKIP [#$idx] $desc — $reason"
@@ -2248,7 +2350,7 @@ test_one() {
     chmod 600 "$tmp"
 
     local syntax_err
-    syntax_err="$(mktemp /tmp/algo_sshd_t.XXXXXX)"
+    syntax_err="$(mktemp "/tmp/algo_sshd_t.$$.XXXXXX")"
 
     if ! "$SSHD_BIN" -t -f "$tmp" >"$syntax_err" 2>&1; then
         reason="$(head -3 "$syntax_err" | tr '\n' ' ')"
@@ -2259,8 +2361,7 @@ test_one() {
         CR="SERVER_CONFIG_REJECTED"
 
         log "实际协商：UNKNOWN"
-        log "协商结果：SKIP"
-        log "认证结果：NOT_TESTED"
+        log "总体结果：SKIP"
         log "原因：sshd -t 配置校验失败：$reason"
 
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
@@ -2279,8 +2380,7 @@ test_one() {
         CR="SERVER_CONFIG_REJECTED"
         reason="sshd -T -f 临时配置失败"
         log "实际协商：UNKNOWN"
-        log "协商结果：SKIP"
-        log "认证结果：NOT_TESTED"
+        log "总体结果：SKIP"
         log "原因：$reason"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -2304,8 +2404,7 @@ test_one() {
             CR="NOT_APPLICABLE"
             reason="sshd -T 最终配置未启用:$effective_unsupported"
             log "实际协商：UNKNOWN"
-            log "协商结果：SKIP"
-            log "认证结果：NOT_TESTED"
+            log "总体结果：SKIP"
             log "原因：$reason"
             record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
                 "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -2324,8 +2423,7 @@ test_one() {
         reason="sshd 重启失败"
 
         log "实际协商：UNKNOWN"
-        log "协商结果：UNKNOWN"
-        log "认证结果：NOT_TESTED"
+        log "总体结果：UNKNOWN"
         log "原因：$reason"
 
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
@@ -2342,8 +2440,7 @@ test_one() {
         reason="sshd 重启后 60 秒内未进入运行状态"
 
         log "实际协商：UNKNOWN"
-        log "协商结果：UNKNOWN"
-        log "认证结果：NOT_TESTED"
+        log "总体结果：UNKNOWN"
         log "原因：$reason"
 
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
@@ -2364,8 +2461,7 @@ test_one() {
         CR="SERVER_CONFIG_MISMATCH"
         reason="sshd 重启后无法读取最终生效配置：sshd -T -f $SSHD_CONFIG"
         log "实际协商：UNKNOWN"
-        log "协商结果：UNKNOWN"
-        log "认证结果：NOT_TESTED"
+        log "总体结果：UNKNOWN"
         log "原因：$reason"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -2387,8 +2483,7 @@ test_one() {
             CR="SERVER_CONFIG_MISMATCH"
             reason="重启后 sshd -T 有效配置与测试项不一致:$running_unsupported"
             log "实际协商：UNKNOWN"
-            log "协商结果：UNKNOWN"
-            log "认证结果：NOT_TESTED"
+            log "总体结果：UNKNOWN"
             log "原因：$reason"
             record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
                 "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -2400,10 +2495,10 @@ test_one() {
     server_log="$(detect_log_file)"
     TEST_START_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
     if [[ -n "$server_log" ]]; then
-        log_before="$(stat -c %s "$server_log" 2>/dev/null || echo 0)"
+        log_before="$(file_size "$server_log")"
     fi
 
-    client_out="$(mktemp /tmp/algo_client.XXXXXX)"
+    client_out="$(mktemp "/tmp/algo_client.$$.XXXXXX")"
 
     if $AUTO; then
         env_log "自动认证：root@127.0.0.1，临时公钥 marker=${AUTO_MARKER}"
@@ -2534,10 +2629,12 @@ test_one() {
             reason="$(last_matching_text "$negotiation_pattern" "$server_delta")"
             [[ -n "$reason" ]] || reason="$(grep -hiE "$negotiation_pattern" "$client_out" 2>/dev/null | tail -1)"
 
-        elif [[ -n "$NK$NC$NM$NH" ]]; then
+        elif { [[ "$cipher" == chacha20-poly1305@openssh.com || "$cipher" == aes128-gcm@openssh.com || "$cipher" == aes256-gcm@openssh.com ]] && [[ -n "$NK$NC$NH" ]]; } || \
+         [[ -n "$NK$NC$NM$NH" ]]; then
             local mac_matches=true
             case "$cipher" in
                 chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)
+                    # AEAD 不协商传统 MAC，日志可能不提取到 NM，直接放行 MAC 比较。
                     mac_matches=true
                     ;;
                 *)
@@ -2721,6 +2818,11 @@ env_log "初始服务状态: $($INITIAL_SERVICE_ACTIVE && echo running || echo s
 env_log "初始 crypto-policy: ${INITIAL_CRYPTO_POLICY:-未检测到}"
 
 for ((i=1; i<=TEST_INDEX; i++)); do
+    # 恢复失败时立即中止，避免 sshd 停留在非预期配置下继续测试（结果全部失真）。
+    if $RESTORE_FAILED; then
+        log "检测到恢复失败，中止剩余测试（SSH 服务可能仍处于测试配置）。"
+        exit 1
+    fi
     test_one "$i"
 done
 
