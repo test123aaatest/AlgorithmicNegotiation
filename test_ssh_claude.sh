@@ -6,6 +6,9 @@
 #   - 必须 root（--list 除外）
 #   - 默认端口 22
 #   - 保留手动模式；--auto 使用本地 127.0.0.1
+#   - 测试期间默认强制 sshd 只监听 127.0.0.1，防止临时放开的
+#     PermitRootLogin/PasswordAuthentication 暴露到外网；
+#     跨主机测试需显式 --allow-remote
 #   - 每次只修改一个测试配置，测试完成后恢复
 #   - 协商结果与认证结果分离
 #   - 算法结果不与 SSH 客户端退出码直接绑定
@@ -66,6 +69,10 @@ TMP_DIR="$BASE_DIR"
 
 AUTO=false
 LIST_ONLY=false
+# 默认强制 sshd 只监听回环地址 127.0.0.1，避免测试期间（临时放开
+# PermitRootLogin/PasswordAuthentication）把 root 登录暴露到外网。
+# 确有跨主机测试需求时才用 --allow-remote 显式放开。
+ALLOW_REMOTE=false
 CRYPTO_POLICY_TOOL=""
 CRYPTO_POLICY_MODE="${CRYPTO_POLICY_MODE:-capability}"
 
@@ -85,8 +92,11 @@ LOOPBACK_TARGET="root@127.0.0.1"
 # 默认端口 22；可用 --port= 覆盖
 PORT=22
 
-LOG_FILE="$(mktemp "${BASE_DIR}/ssh_algorithm_test_${TS}_XXXXXX.txt")" || {
-    echo "错误：无法创建安全日志文件" >&2
+# 日志先落在当前工作目录；若该目录不可写/已被删除（如 cd 到已删除目录），
+# mktemp 会失败，此时回退到 /tmp，仅当两处都失败才退出，避免脚本完全无法运行。
+LOG_FILE="$(mktemp "${BASE_DIR}/ssh_algorithm_test_${TS}_XXXXXX.txt" 2>/dev/null)" || \
+    LOG_FILE="$(mktemp "/tmp/ssh_algorithm_test_${TS}_XXXXXX.txt" 2>/dev/null)" || {
+    echo "错误：无法创建安全日志文件（已尝试 ${BASE_DIR} 与 /tmp）" >&2
     exit 1
 }
 chmod 600 "$LOG_FILE" || {
@@ -98,6 +108,9 @@ RESTORED=false
 # 恢复失败标记：任意恢复步骤失败即中止脚本并带非零退出码退出，
 # 避免 sshd 以测试配置继续运行导致后续测试全部失真。
 RESTORE_FAILED=false
+# restore_all 的返回码（0=已完整恢复，1=存在恢复失败项）。由 trap 调用点
+# 读取，用于决定最终退出码，避免在 restore_all 内部直接 exit。
+RESTORE_EXIT_CODE=0
 CLIENT_PID=""
 TEST_INDEX=0
 RUN_INDEX=0
@@ -127,14 +140,20 @@ INITIAL_SERVICE_ACTIVE=false
 INITIAL_SERVICE_KNOWN=false
 INITIAL_CRYPTO_POLICY=""
 CRYPTO_POLICY_CHANGED=false
+# 本脚本实际写入的 crypto-policy 值（仅在成功切换时置位）。恢复时用于
+# 精确判断当前值是否仍为本脚本所写。
+CRYPTO_POLICY_APPLIED=""
 GENERATED_HOST_KEYS=()
 GENERATED_HOST_KEYS_FILE="${STATE_DIR}/generated_hostkeys.list"
 CRYPTO_POLICY_STATE_FILE="${STATE_DIR}/crypto_policy.state"
 # 记录本测试覆盖前已存在的原文件备份（RESTORE_HELPER / systemd drop-in 等），
 # 恢复时原样还原，避免覆盖/删除管理员已有配置。
 PREEXISTING_BACKUPS=()
-# 本测试创建的所有临时文件清单，恢复时精确删除，避免按 glob 误删其它进程文件。
-TRACKED_TMP_FILES=()
+# 说明：本脚本的测试临时文件（algo_client.* / algo_sshd_t.* / ssh_algo_probe.*
+# / ssh_algo_single.* / ssh1probe.*）统一创建于受保护的 $TMP_DIR（=STATE_DIR）
+# 内，恢复时按这些受控前缀 glob 清理；/etc/ssh 下的临时文件则按
+# ALGO_TEST_ACTIVE_MARKER 内容过滤后再删。因此不再维护逐文件登记清单，
+# 避免"设计与实现不一致"。若日后需要更精细的清理，可在此恢复登记数组。
 AUTO_AUTH_KEY_ADDED=false
 AUTHORIZED_KEYS_FILE="/root/.ssh/authorized_keys"
 AUTHORIZED_KEYS_BACKUP=""
@@ -170,17 +189,20 @@ SERVICE="unknown"
 INIT="unknown"
 PROFILE="unknown"
 
-declare -a DESCS KEXES CIPHERS MACS HOSTKEYS TEST_GROUPS PROTOCOLS COMPRESSIONS DEFAULT_FLAGS PRECHECK_STATUS PRECHECK_REASON
+# 注意：脚本启用了 set -u。declare -a/-A 只声明、未赋值时，空数组上的
+# ${#arr[@]} 会触发 "unbound variable" 直接崩溃（bash 各版本均如此，即使
+# 5.x）。因此这里统一用 =() 显式初始化为空数组。
+declare -a DESCS=() KEXES=() CIPHERS=() MACS=() HOSTKEYS=() TEST_GROUPS=() PROTOCOLS=() COMPRESSIONS=() DEFAULT_FLAGS=() PRECHECK_STATUS=() PRECHECK_REASON=()
 # 跨 loader 共享的去重集合：所有动态生成器共用，避免 openssh8 等多 loader
 # 场景下不同生成器产生重复四元组。bash 关联数组，需 bash>=4。
-declare -A GLOBAL_SEEN
-declare -A PLAN_COVERAGE_SEEN
-declare -A ACTUAL_SSH1_COVERAGE_SEEN
-declare -A ACTUAL_SSH2_COVERAGE_SEEN
-declare -A SSH1_COVERAGE_SEEN
-declare -A SSH2_COVERAGE_SEEN
-declare -A PREEXISTING_PATH_SEEN
-declare -a NORMAL_CANDIDATE_KEX NORMAL_CANDIDATE_CIPHER NORMAL_CANDIDATE_MAC NORMAL_CANDIDATE_HOSTKEY NORMAL_CANDIDATE_COMPRESSION
+declare -A GLOBAL_SEEN=()
+declare -A PLAN_COVERAGE_SEEN=()
+declare -A ACTUAL_SSH1_COVERAGE_SEEN=()
+declare -A ACTUAL_SSH2_COVERAGE_SEEN=()
+declare -A SSH1_COVERAGE_SEEN=()
+declare -A SSH2_COVERAGE_SEEN=()
+declare -A PREEXISTING_PATH_SEEN=()
+declare -a NORMAL_CANDIDATE_KEX=() NORMAL_CANDIDATE_CIPHER=() NORMAL_CANDIDATE_MAC=() NORMAL_CANDIDATE_HOSTKEY=() NORMAL_CANDIDATE_COMPRESSION=()
 RESULT_COMPRESSION="N/A"
 RESULT_COMPRESSION_ACTUAL="UNKNOWN"
 RESULT_COMMAND="NOT_RUN"
@@ -375,6 +397,10 @@ crypto_policy_relax_for_test() {
     log "Temporarily switching crypto policy from '$INITIAL_CRYPTO_POLICY' to 'LEGACY' for capability test"
     if "$CRYPTO_POLICY_TOOL" --set LEGACY >/dev/null 2>&1; then
         CRYPTO_POLICY_CHANGED=true
+        # 记录本脚本实际写入的值。恢复时必须精确比对"当前值 == 我写入的值"，
+        # 而不是"当前值 == LEGACY 这个常量"，否则别的进程/管理员在测试期间
+        # 恰好也把策略改成 LEGACY 时，会被误判为"是我改的"而被覆盖。
+        CRYPTO_POLICY_APPLIED="LEGACY"
         if [[ -n "${STATE_DIR_CREATED:-}" && "$STATE_DIR_CREATED" == true && -n "$INITIAL_CRYPTO_POLICY" ]]; then
             printf '%s\n' "$INITIAL_CRYPTO_POLICY" > "$CRYPTO_POLICY_STATE_FILE" || true
             chmod 600 "$CRYPTO_POLICY_STATE_FILE" 2>/dev/null || true
@@ -415,9 +441,15 @@ for arg in "$@"; do
   --only=N           只运行编号为 N 的测试项（可与 --auto 组合）
   --only=keyword     只运行描述包含 keyword 的测试项
   --port=N           指定测试端口（默认 22）
+  --allow-remote     允许 sshd 测试期间监听非回环地址（默认仅 127.0.0.1）
+                     注意：测试会临时开启 PermitRootLogin/PasswordAuthentication，
+                     放开监听范围意味着这些弱配置对外网可见，仅在隔离网络中使用。
   -h, --help         显示此帮助信息
 EOF
             exit 0
+            ;;
+        --allow-remote)
+            ALLOW_REMOTE=true
             ;;
         *)
             echo "警告：未识别参数 '$arg'，已忽略" >&2
@@ -443,19 +475,45 @@ log() {
 }
 
 initialize_log_file() {
+    # 把日志从当前目录（可能是普通用户可读写的 /tmp 等）迁到受保护的
+    # 状态目录下（0700 目录 + 0600 文件）。STATE_DIR 形如
+    # /var/lib/ssh-algo-unified/<TS>_<PID>，取其父目录 STATE_ROOT。
     local log_dir="${STATE_DIR%/*}"
-    mkdir -p -m 700 "$log_dir" 2>/dev/null || {
-        echo "错误：无法创建受保护日志目录：$log_dir" >&2
-        exit 1
-    }
-    LOG_FILE="$(mktemp "${log_dir}/ssh_algorithm_test_${TS}_XXXXXX.txt")" || {
-        echo "错误：无法创建安全日志文件" >&2
-        exit 1
-    }
-    chmod 600 "$LOG_FILE" 2>/dev/null || {
-        echo "错误：无法设置日志文件权限：$LOG_FILE" >&2
-        exit 1
-    }
+    local prev_log="$LOG_FILE"
+
+    # 注意 SC2174：mkdir -p 的 -m 只作用于最深层目录，父目录（如
+    # /var/lib/ssh-algo-unified 乃至 /var/lib）不受其约束。这里分层创建
+    # 并对每一层显式 chmod，避免中间目录以默认 umask 权限裸露。
+    local p _created=""
+    local IFS='/'
+    local acc=""
+    for p in $log_dir; do
+        [[ -n "$p" ]] || continue
+        acc="${acc:+$acc/}$p"
+        [[ -e "$acc" ]] && continue
+        mkdir "$acc" 2>/dev/null || break
+        _created="$acc"
+    done
+    [[ -n "$_created" ]] && chmod 700 "$_created" 2>/dev/null || true
+
+    if [[ -d "$log_dir" && -w "$log_dir" ]]; then
+        if LOG_FILE="$(mktemp "${log_dir}/ssh_algorithm_test_${TS}_XXXXXX.txt" 2>/dev/null)"; then
+            if chmod 600 "$LOG_FILE" 2>/dev/null; then
+                [[ -n "$prev_log" && -f "$prev_log" ]] && rm -f "$prev_log" 2>/dev/null || true
+                return 0
+            fi
+        fi
+    fi
+
+    # 无法落盘到受保护目录时回退到原先的 BASE_DIR 日志，而不是直接退出，
+    # 避免只读运行目录导致脚本完全无法运行。
+    LOG_FILE="$prev_log"
+    if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
+        printf '%s\n' "[警告] 无法在受保护目录 $log_dir 创建日志，继续使用当前目录日志：$LOG_FILE"
+        return 0
+    fi
+    echo "错误：无法创建安全日志文件" >&2
+    exit 1
 }
 
 env_log() {
@@ -474,7 +532,6 @@ warn() {
 
 detect_env() {
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
         . /etc/os-release
         OS_ID="${ID:-unknown}"
         OS_VERSION_ID="${VERSION_ID:-unknown}"
@@ -576,7 +633,16 @@ detect_env() {
     fi
 
     # ---- openEuler 国密环境检测（优先于版本号判定）----
-    if [[ "$OS_ID" =~ ^openeuler$ ]] || grep -qi "openeuler" /etc/os-release 2>/dev/null; then
+    # 只认 /etc/os-release 的 ID 字段（已解析为 OS_ID），不再对整份文件做
+    # 子串匹配——后者会把 PRETTY_NAME/注释里偶然出现的 "openeuler" 也当成
+    # openEuler。注意 openEuler 官方 os-release 里 ID="openEuler"（大写 E），
+    # 故比较必须大小写不敏感，否则本应识别的 openEuler 机器会全部落到版本
+    # 分支、丢失国密/SM 测试与 sm2 主机密钥准备。
+    # 同时要求 sshd 与配置文件可用，与其它画像保持一致：否则后续
+    # server_filter_status 会因 SSHD_BIN 为空全部返回 PRECHECK_ERROR，
+    # 生成大量 UNKNOWN 项却不具备真实测试条件。
+    local os_id_lc="${OS_ID,,}"
+    if [[ "$os_id_lc" == "openeuler" ]] && [[ -n "$SSHD_BIN" && -f "$SSHD_CONFIG" ]]; then
         PROFILE="openeuler"
         return 0
     fi
@@ -672,7 +738,10 @@ default_algorithm_supported() {
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_ed25519_key$' && return 0 ;;
                 ssh-ed448)
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_ed448_key$' && return 0 ;;
-                ecdsa-*|ecdsa-sha2-nistp256-cert-v01@openssh.com|ecdsa-sha2-nistp384-cert-v01@openssh.com|ecdsa-sha2-nistp521-cert-v01@openssh.com)
+                # ecdsa-* 覆盖所有 ECDSA 算法及其 -cert-v01 变体；原先在其后
+                # 重复列出的 ecdsa-sha2-nistp*-cert 分支永远不会命中（SC2221/
+                # SC2222），此处删除冗余分支。
+                ecdsa-*)
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_ecdsa_key$' && return 0 ;;
                 ssh-sm2|sm2)
                     printf '%s\n' "$DEFAULT_HOSTKEY" | grep -Eq '(^|/)ssh_host_sm2_key$' && return 0 ;;
@@ -858,38 +927,50 @@ mark_normal_coverage() {
     # 这里只记录生成器已经安排的计划 Coverage；真实协商结果必须由
     # mark_actual_coverage 单独记录，不能反过来影响后续测试项生成。
     local proto="$1" kex="$2" cipher="$3" mac="$4" hostkey="$5" group="$6" compression="${7:-}"
-    local -n coverage
-    if [[ "$proto" == "1" ]]; then
-        coverage=SSH1_COVERAGE_SEEN
-    elif [[ "$proto" == "2" ]]; then
-        coverage=SSH2_COVERAGE_SEEN
-    else
-        return 0
-    fi
+    # 注意：不能写 "local -n coverage" 后再 "coverage=SSH1_COVERAGE_SEEN"。
+    # 不带 =target 的 local -n 创建的是"未绑定" nameref，向它赋值只是把
+    # 字符串塞进 nameref 本身，随后 coverage["..."]=1 会在 set -u 下报
+    # "coverage: unbound variable" 直接崩溃。改为显式分支直接操作目标
+    # 关联数组，既避免崩溃，也避免 nameref 意外污染调用方同名变量。
+    case "$proto" in
+        1|2) ;;
+        *) return 0 ;;
+    esac
     [[ "$group" == *"NORMAL"* ]] || return 0
-    coverage["kex|$kex"]=1
-    coverage["cipher|$cipher"]=1
-    coverage["hostkey|$hostkey"]=1
-    [[ -n "$compression" ]] && coverage["compression|$compression"]=1
-    [[ "$proto" == "2" ]] && {
+
+    if [[ "$proto" == "1" ]]; then
+        SSH1_COVERAGE_SEEN["kex|$kex"]=1
+        SSH1_COVERAGE_SEEN["cipher|$cipher"]=1
+        SSH1_COVERAGE_SEEN["hostkey|$hostkey"]=1
+        [[ -n "$compression" ]] && SSH1_COVERAGE_SEEN["compression|$compression"]=1
+    else
+        SSH2_COVERAGE_SEEN["kex|$kex"]=1
+        SSH2_COVERAGE_SEEN["cipher|$cipher"]=1
+        SSH2_COVERAGE_SEEN["hostkey|$hostkey"]=1
+        [[ -n "$compression" ]] && SSH2_COVERAGE_SEEN["compression|$compression"]=1
         PLAN_COVERAGE_SEEN["kex|$kex"]=1
         PLAN_COVERAGE_SEEN["cipher|$cipher"]=1
         PLAN_COVERAGE_SEEN["hostkey|$hostkey"]=1
         [[ -n "$compression" ]] && PLAN_COVERAGE_SEEN["compression|$compression"]=1
-    }
+    fi
+
     case "$cipher" in
         chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com) ;;
         *) [[ -n "$mac" ]] && {
-            coverage["mac|$mac"]=1
-            [[ "$proto" == "2" ]] && PLAN_COVERAGE_SEEN["mac|$mac"]=1
+            if [[ "$proto" == "1" ]]; then
+                SSH1_COVERAGE_SEEN["mac|$mac"]=1
+            else
+                SSH2_COVERAGE_SEEN["mac|$mac"]=1
+                PLAN_COVERAGE_SEEN["mac|$mac"]=1
+            fi
         } ;;
     esac
 }
 
 mark_actual_coverage() {
+    # actual_coverage 是 nameref，在两个分支里分别绑定到 SSH2/SSH1 的关联数组
     local proto="$1" kex="$2" cipher="$3" mac="$4" hostkey="$5" compression="${6:-}" nr="${7:-UNKNOWN}"
     [[ "$nr" == "PASS" ]] || return 0
-
     if [[ "$proto" == "2" ]]; then
         local -n actual_coverage=ACTUAL_SSH2_COVERAGE_SEEN
         [[ -n "$kex" && "$kex" != "UNKNOWN" ]] &&
@@ -1134,11 +1215,7 @@ repair_normal_coverage() {
     local lk=${#NORMAL_CANDIDATE_KEX[@]}
     local lh=${#NORMAL_CANDIDATE_HOSTKEY[@]}
     local lz=${#NORMAL_CANDIDATE_COMPRESSION[@]}
-    local base_kex="${NORMAL_CANDIDATE_KEX[0]:-}"
-    local base_cipher="${NORMAL_CANDIDATE_CIPHER[0]:-}"
-    local base_mac="${NORMAL_CANDIDATE_MAC[0]:-}"
-    local base_hostkey="${NORMAL_CANDIDATE_HOSTKEY[0]:-}"
-    local first_non_aead="" algo c m h k desc
+    local first_non_aead="" c m h k desc
     local ki ci mi hi added
 
     for c in "${NORMAL_CANDIDATE_CIPHER[@]}"; do
@@ -1151,20 +1228,20 @@ repair_normal_coverage() {
     # 每个缺失 KEX 至少生成一个新的、完整的 NORMAL 组合。
     for k in "${NORMAL_CANDIDATE_KEX[@]}"; do
         [[ -n "${PLAN_COVERAGE_SEEN["kex|$k"]:-}" ]] && continue
-        added=false
-        for ((ci=0; ci<lc && added==false; ci++)); do
+        added=0
+        for ((ci=0; ci<lc && added == 0; ci++)); do
             c="${NORMAL_CANDIDATE_CIPHER[$ci]}"
-            for ((hi=0; hi<lh && added==false; hi++)); do
+            for ((hi=0; hi<lh && added == 0; hi++)); do
                 h="${NORMAL_CANDIDATE_HOSTKEY[$hi]}"
                 if [[ "$c" =~ ^(chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)$ ]]; then
                     m=""
                     desc="NORMAL覆盖补齐: kex=$k cipher=$c mac=NONE hostkey=$h"
-                    normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=true
+                    normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=1
                 else
-                    for ((mi=0; mi<lm && added==false; mi++)); do
+                    for ((mi=0; mi<lm && added == 0; mi++)); do
                         m="${NORMAL_CANDIDATE_MAC[$mi]}"
                         desc="NORMAL覆盖补齐: kex=$k cipher=$c mac=$m hostkey=$h"
-                        normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=true
+                        normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=1
                     done
                 fi
             done
@@ -1175,20 +1252,20 @@ repair_normal_coverage() {
     for c in "${NORMAL_CANDIDATE_CIPHER[@]}"; do
         [[ -n "${PLAN_COVERAGE_SEEN["cipher|$c"]:-}" ]] && continue
         [[ "$lc" -gt 0 ]] || continue
-        added=false
-        for ((ki=0; ki<lk && added==false; ki++)); do
+        added=0
+        for ((ki=0; ki<lk && added == 0; ki++)); do
             k="${NORMAL_CANDIDATE_KEX[$ki]}"
-            for ((hi=0; hi<lh && added==false; hi++)); do
+            for ((hi=0; hi<lh && added == 0; hi++)); do
                 h="${NORMAL_CANDIDATE_HOSTKEY[$hi]}"
                 if [[ "$c" =~ ^(chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)$ ]]; then
                     m=""
                     desc="NORMAL覆盖补齐: kex=$k cipher=$c mac=NONE hostkey=$h"
-                    normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=true
+                    normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=1
                 else
-                    for ((mi=0; mi<lm && added==false; mi++)); do
+                    for ((mi=0; mi<lm && added == 0; mi++)); do
                         m="${NORMAL_CANDIDATE_MAC[$mi]}"
                         desc="NORMAL覆盖补齐: kex=$k cipher=$c mac=$m hostkey=$h"
-                        normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=true
+                        normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=1
                     done
                 fi
             done
@@ -1198,20 +1275,20 @@ repair_normal_coverage() {
     # 每个缺失 HostKey 至少生成一个新的 NORMAL 组合。
     for h in "${NORMAL_CANDIDATE_HOSTKEY[@]}"; do
         [[ -n "${PLAN_COVERAGE_SEEN["hostkey|$h"]:-}" ]] && continue
-        added=false
-        for ((ki=0; ki<lk && added==false; ki++)); do
+        added=0
+        for ((ki=0; ki<lk && added == 0; ki++)); do
             k="${NORMAL_CANDIDATE_KEX[$ki]}"
-            for ((ci=0; ci<lc && added==false; ci++)); do
+            for ((ci=0; ci<lc && added == 0; ci++)); do
                 c="${NORMAL_CANDIDATE_CIPHER[$ci]}"
                 if [[ "$c" =~ ^(chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)$ ]]; then
                     m=""
                     desc="NORMAL覆盖补齐: kex=$k cipher=$c mac=NONE hostkey=$h"
-                    normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=true
+                    normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=1
                 else
-                    for ((mi=0; mi<lm && added==false; mi++)); do
+                    for ((mi=0; mi<lm && added == 0; mi++)); do
                         m="${NORMAL_CANDIDATE_MAC[$mi]}"
                         desc="NORMAL覆盖补齐: kex=$k cipher=$c mac=$m hostkey=$h"
-                        normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=true
+                        normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐" && added=1
                     done
                 fi
             done
@@ -1222,13 +1299,13 @@ repair_normal_coverage() {
     if [[ -n "$first_non_aead" ]]; then
         for m in "${NORMAL_CANDIDATE_MAC[@]}"; do
             [[ -n "${PLAN_COVERAGE_SEEN["mac|$m"]:-}" ]] && continue
-            added=false
-            for ((ki=0; ki<lk && added==false; ki++)); do
+            added=0
+            for ((ki=0; ki<lk && added == 0; ki++)); do
                 k="${NORMAL_CANDIDATE_KEX[$ki]}"
-                for ((hi=0; hi<lh && added==false; hi++)); do
+                for ((hi=0; hi<lh && added == 0; hi++)); do
                     h="${NORMAL_CANDIDATE_HOSTKEY[$hi]}"
                     desc="NORMAL覆盖补齐: kex=$k cipher=$first_non_aead mac=$m hostkey=$h"
-                    normal_try_add "$desc" "$k" "$first_non_aead" "$m" "$h" "NORMAL/覆盖补齐/MAC" && added=true
+                    normal_try_add "$desc" "$k" "$first_non_aead" "$m" "$h" "NORMAL/覆盖补齐/MAC" && added=1
                 done
             done
         done
@@ -1239,7 +1316,7 @@ repair_normal_coverage() {
     if (( lz > 0 )); then
         for z in "${NORMAL_CANDIDATE_COMPRESSION[@]}"; do
             [[ -n "${PLAN_COVERAGE_SEEN["compression|$z"]:-}" ]] && continue
-            added=false
+            added=0
             k="${NORMAL_CANDIDATE_KEX[0]:-}"
             c="${NORMAL_CANDIDATE_CIPHER[0]:-}"
             h="${NORMAL_CANDIDATE_HOSTKEY[0]:-}"
@@ -1247,7 +1324,7 @@ repair_normal_coverage() {
             [[ "$c" =~ ^(chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)$ ]] && m=""
             if [[ -n "$k$c$h" ]]; then
                 desc="NORMAL覆盖补齐: kex=$k cipher=$c mac=${m:-NONE} hostkey=$h compression=$z"
-                normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐/Compression" "$z" && added=true
+                normal_try_add "$desc" "$k" "$c" "$m" "$h" "NORMAL/覆盖补齐/Compression" "$z" && added=1
             fi
         done
     fi
@@ -2000,9 +2077,18 @@ record_initial_state() {
 
 backup_config() {
     [[ -f "$SSHD_CONFIG" ]] || die "配置文件不存在：$SSHD_CONFIG"
-    mkdir -p -m 700 "$STATE_DIR" || die "无法创建状态目录：$STATE_DIR"
+    # SC2174：mkdir -p -m 只作用于最深层目录。STATE_ROOT(/var/lib/ssh-algo-unified)
+    # 若不存在会以默认 umask 创建，这里显式创建并收紧权限为 700。
+    if [[ ! -d "${STATE_ROOT}" ]]; then
+        mkdir -p "${STATE_ROOT}" 2>/dev/null || true
+        chmod 700 "${STATE_ROOT}" 2>/dev/null || true
+    fi
+    mkdir -p "$STATE_DIR" || die "无法创建状态目录：$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
     STATE_DIR_CREATED=true
     TMP_DIR="$STATE_DIR"
+    # 状态目录就绪后立即把日志迁入受保护目录（此前日志临时落在 BASE_DIR）。
+    initialize_log_file
     AUTO_KEY="${STATE_DIR}/algo_test_key"
     AUTO_PUB="${AUTO_KEY}.pub"
     AUTO_SSH1_KEY="${STATE_DIR}/algo_test_ssh1_key"
@@ -2252,7 +2338,9 @@ restore_all() {
     if $CRYPTO_POLICY_CHANGED && command -v update-crypto-policies >/dev/null 2>&1 && [[ -n "$INITIAL_CRYPTO_POLICY" ]]; then
         local current_crypto=""
         current_crypto="$(update-crypto-policies --show 2>/dev/null || true)"
-        if [[ "$current_crypto" == "LEGACY" ]]; then
+        # 只有"当前值 == 本脚本写入的值"才恢复；与常量 LEGACY 比较会把
+        # 他人恰好在测试期间设成的 LEGACY 误判为本脚本所为而覆盖。
+        if [[ -n "$CRYPTO_POLICY_APPLIED" && "$current_crypto" == "$CRYPTO_POLICY_APPLIED" ]]; then
             if update-crypto-policies --set "$INITIAL_CRYPTO_POLICY" >/dev/null 2>&1; then
                 log "[恢复] crypto-policy 已恢复：$INITIAL_CRYPTO_POLICY"
             else
@@ -2260,7 +2348,7 @@ restore_all() {
                 RESTORE_FAILED=true
             fi
         else
-            log "[恢复] WARNING：crypto-policy 当前为 '$current_crypto'，不是本脚本设置的 LEGACY；跳过恢复，避免覆盖其他进程的修改"
+            log "[恢复] WARNING：crypto-policy 当前为 '$current_crypto'，不是本脚本设置的 '$CRYPTO_POLICY_APPLIED'；跳过恢复，避免覆盖其他进程的修改"
         fi
     fi
 
@@ -2364,9 +2452,16 @@ restore_all() {
     log "[恢复] 临时文件和测试客户端已清理"
     if $RESTORE_FAILED; then
         log "[恢复] ERROR：存在恢复失败项；为避免 sshd 停留在测试配置上，脚本以非零码退出。"
-        exit 1
+        # 不在本函数内 exit：本函数会作为 EXIT/INT/TERM trap 的回调被调用，
+        # 内部 exit 会改写真实退出码（丢失 INT=130 / TERM=143），也与
+        # trap ... EXIT 叠加存在递归风险。改为置位 RESTORE_FAILED 并返回
+        # 非零，退出码由各调用点自行决定。
+        RESTORE_EXIT_CODE=1
+        return 1
     fi
+    RESTORE_EXIT_CODE=0
     log "[恢复] 完成"
+    return 0
 }
 
 backup_preexisting() {
@@ -2374,7 +2469,8 @@ backup_preexisting() {
     # 备份到 STATE_DIR，恢复时通过 PREEXISTING_BACKUPS 还原，避免覆盖管理员原有文件。
     local f="$1"
     [[ -n "$f" && -e "$f" ]] || return 0
-    local bak="$STATE_DIR/preexisting_$(basename "$f").$$"
+    local bak=""
+    bak="$STATE_DIR/preexisting_$(basename "$f").$$"
     if cp -a "$f" "$bak" 2>/dev/null; then
         PREEXISTING_BACKUPS+=("$f|$bak")
         PREEXISTING_PATH_SEEN["$f"]=1
@@ -2383,6 +2479,68 @@ backup_preexisting() {
     fi
     log "[恢复] ERROR：无法备份将被覆盖的已有路径：$f"
     return 1
+}
+
+inject_helper_values() {
+    # 把自愈脚本里的 @NAME@ 占位符替换为真实值。
+    # 设计要点：
+    # 1) 值以单引号包裹写出：helper 是 bash 脚本，路径若含 $ / ` / \ 会在
+    #    执行时被二次展开（如工作目录 /opt/work$dir），单引号可保持字面量，
+    #    内部单引号按 '\'' 规则转义。
+    # 2) 占位符用 @NAME@ 而非 ${NAME}：helper 正文里有 AUTH_BACKUP="${BACKUP}.authkeys"
+    #    这类引用“已注入变量”的行，占位符若写成 ${BACKUP} 会被误替换。
+    # 3) 用 awk 单次从左到右扫描替换：匹配即插入值并跳过，绝不回头扫描已插入
+    #    文本，因此即使某个真实值里含 "@BACKUP@" 之类字面量也不会被二次替换；
+    #    基于 substr 的字面拼接也不受 & \ 等替换串元字符影响。
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+
+    # 生成 NAME<TAB>value 映射，值统一单引号化
+    local map
+    map="$(mktemp "${TMP_DIR}/helper_map.XXXXXX" 2>/dev/null || mktemp /tmp/helper_map.XXXXXX)" || return 1
+    _emit_pair() {
+        local name="$1" val="$2"
+        printf '%s\t%s\n' "$name" "'${val//\'/\'\\\'\'}'"
+    }
+    {
+        _emit_pair CONFIG              "$SSHD_CONFIG"
+        _emit_pair BACKUP              "$BACKUP_FILE"
+        _emit_pair SERVICE             "$SERVICE"
+        _emit_pair INITIAL_SERVICE_KNOWN "$INITIAL_SERVICE_KNOWN"
+        _emit_pair INITIAL_SERVICE_ACTIVE "$INITIAL_SERVICE_ACTIVE"
+        _emit_pair PIDFILE             "$PID_FILE"
+        _emit_pair AUTH_FILE           "$AUTHORIZED_KEYS_FILE"
+        _emit_pair HELPER              "$RESTORE_HELPER"
+        _emit_pair HOSTKEY_LIST        "$GENERATED_HOST_KEYS_FILE"
+        _emit_pair CRYPTO_STATE        "$CRYPTO_POLICY_STATE_FILE"
+        _emit_pair AUTO_KEY            "$AUTO_KEY"
+        _emit_pair AUTO_PUB            "$AUTO_PUB"
+        _emit_pair AUTO_SSH1_KEY       "$AUTO_SSH1_KEY"
+        _emit_pair AUTO_SSH1_PUB       "$AUTO_SSH1_PUB"
+        _emit_pair DROPIN              "$SYSTEMD_DROPIN_FILE"
+        _emit_pair DROPIN_DIR          "$SYSTEMD_DROPIN_DIR"
+        _emit_pair HELPER_BACKUP       "$helper_backup"
+        _emit_pair HELPER_PREEXISTING  "$helper_preexisting"
+        _emit_pair DROPIN_BACKUP       "$dropin_backup"
+        _emit_pair DROPIN_PREEXISTING  "$dropin_preexisting"
+    } > "$map" || { rm -f "$map"; return 1; }
+
+    local out="$file.repl"
+    awk -F'\t' '
+        NR==FNR { v[$1]=substr($0, index($0,$2)); next }
+        {
+            o=""; r=$0
+            while (match(r, /@[A-Z0-9_]+@/)) {
+                tok=substr(r, RSTART+1, RLENGTH-2)
+                o = o substr(r,1,RSTART-1) (tok in v ? v[tok] : substr(r,RSTART,RLENGTH))
+                r = substr(r, RSTART+RLENGTH)
+            }
+            print o r
+        }
+    ' "$map" "$file" > "$out" || { rm -f "$map" "$out"; return 1; }
+    rm -f "$map"
+    mv -f "$out" "$file" || { rm -f "$out"; return 1; }
+    return 0
 }
 
 install_recovery() {
@@ -2395,8 +2553,9 @@ install_recovery() {
         SYSTEMD_DROPIN_FILE="${SYSTEMD_DROPIN_DIR}/ssh-algo-unified.conf"
 
         local helper_tmp dropin_tmp helper_preexisting=false dropin_preexisting=false
-        local helper_backup="${STATE_DIR}/preexisting_$(basename "$RESTORE_HELPER").$$"
-        local dropin_backup="${STATE_DIR}/preexisting_$(basename "$SYSTEMD_DROPIN_FILE").$$"
+        local helper_backup="" dropin_backup=""
+        helper_backup="${STATE_DIR}/preexisting_$(basename "$RESTORE_HELPER").$$"
+        dropin_backup="${STATE_DIR}/preexisting_$(basename "$SYSTEMD_DROPIN_FILE").$$"
         if [[ -e "$RESTORE_HELPER" ]]; then
             helper_preexisting=true
             RESTORE_HELPER_PREEXISTING=true
@@ -2413,36 +2572,43 @@ install_recovery() {
             log "[恢复] ERROR：无法创建恢复脚本临时文件"
             return 1
         }
-        if ! cat > "$helper_tmp" <<EOF
+        # 注意：分隔符必须用 <<'EOF'（带引号）关闭 here-doc 内插值，且所有
+        # 占位符写成 \${VAR}。若用不带引号的 <<EOF，当前 shell 会先展开一次，
+        # 一旦路径含 $ / 反引号 / 反斜杠（如工作目录 /opt/work$dir），生成的
+        # helper 会对这些字符二次展开，set -u 下直接 unbound variable 崩溃，
+        # 导致崩溃自愈静默失效。这里写成 NAME=${PLACEHOLDER}（右侧为单 token
+        # 占位符），由 inject_helper_values 注入“单引号包裹的字面路径”，使 helper
+        # 执行时不会对路径里的 $ / ` / \ 二次展开。
+        if ! cat > "$helper_tmp" <<'EOF'
 #!/bin/bash
 set -u
-CONFIG="$SSHD_CONFIG"
-BACKUP="$BACKUP_FILE"
+CONFIG=@CONFIG@
+BACKUP=@BACKUP@
 MARKER="# ALGO_TEST_ACTIVE_MARKER_DO_NOT_EDIT"
-PIDFILE="$PID_FILE"
-SERVICE="$SERVICE"
-INITIAL_SERVICE_KNOWN="$INITIAL_SERVICE_KNOWN"
-INITIAL_SERVICE_ACTIVE="$INITIAL_SERVICE_ACTIVE"
-DROPIN="$SYSTEMD_DROPIN_FILE"
-DROPIN_DIR="$SYSTEMD_DROPIN_DIR"
-HELPER="$RESTORE_HELPER"
-HELPER_BACKUP="$helper_backup"
-HELPER_PREEXISTING="$helper_preexisting"
-DROPIN_BACKUP="$dropin_backup"
-DROPIN_PREEXISTING="$dropin_preexisting"
-AUTH_FILE="$AUTHORIZED_KEYS_FILE"
-AUTH_BACKUP="\${BACKUP}.authkeys"
-AUTH_ADDED="\${BACKUP}.authkeys.added"
-AUTH_ABSENT="\${BACKUP}.authkeys.absent"
-AUTH_ACTIVE="\${BACKUP}.authkeys.active"
-SSHDIR_ABSENT="\${BACKUP}.sshdir.absent"
-SSHDIR_STATE="\${BACKUP}.sshdir.state"
-HOSTKEY_LIST="${GENERATED_HOST_KEYS_FILE}"
-CRYPTO_STATE="${CRYPTO_POLICY_STATE_FILE}"
-AUTO_KEY="${AUTO_KEY}"
-AUTO_PUB="${AUTO_PUB}"
-AUTO_SSH1_KEY="${AUTO_SSH1_KEY}"
-AUTO_SSH1_PUB="${AUTO_SSH1_PUB}"
+PIDFILE=@PIDFILE@
+SERVICE=@SERVICE@
+INITIAL_SERVICE_KNOWN=@INITIAL_SERVICE_KNOWN@
+INITIAL_SERVICE_ACTIVE=@INITIAL_SERVICE_ACTIVE@
+DROPIN=@DROPIN@
+DROPIN_DIR=@DROPIN_DIR@
+HELPER=@HELPER@
+HELPER_BACKUP=@HELPER_BACKUP@
+HELPER_PREEXISTING=@HELPER_PREEXISTING@
+DROPIN_BACKUP=@DROPIN_BACKUP@
+DROPIN_PREEXISTING=@DROPIN_PREEXISTING@
+AUTH_FILE=@AUTH_FILE@
+AUTH_BACKUP="${BACKUP}.authkeys"
+AUTH_ADDED="${BACKUP}.authkeys.added"
+AUTH_ABSENT="${BACKUP}.authkeys.absent"
+AUTH_ACTIVE="${BACKUP}.authkeys.active"
+SSHDIR_ABSENT="${BACKUP}.sshdir.absent"
+SSHDIR_STATE="${BACKUP}.sshdir.state"
+HOSTKEY_LIST=@HOSTKEY_LIST@
+CRYPTO_STATE=@CRYPTO_STATE@
+AUTO_KEY=@AUTO_KEY@
+AUTO_PUB=@AUTO_PUB@
+AUTO_SSH1_KEY=@AUTO_SSH1_KEY@
+AUTO_SSH1_PUB=@AUTO_SSH1_PUB@
 
 hostkey_file_identity() {
     local file="\$1"
@@ -2583,6 +2749,13 @@ EOF
             log "[恢复] ERROR：无法写入 systemd 自愈脚本"
             return 1
         fi
+        # here-doc 以字面量写出占位符（\$VAR），此处用 sed 精确注入真实值。
+        # 用 | 作分隔符并转义替换文本中的 & 和 |，避免路径含 sed 元字符时出错。
+        if ! inject_helper_values "$helper_tmp"; then
+            rm -f "$helper_tmp"
+            log "[恢复] ERROR：无法注入自愈脚本变量"
+            return 1
+        fi
         if ! chmod 755 "$helper_tmp" ||
            ! backup_preexisting "$RESTORE_HELPER" ||
            ! mv -f "$helper_tmp" "$RESTORE_HELPER"; then
@@ -2636,7 +2809,8 @@ EOF
             return 1
         fi
         local cron_tmp current helper_preexisting=false
-        local helper_backup="${STATE_DIR}/preexisting_$(basename "$RESTORE_HELPER").$$"
+        local helper_backup=""
+        helper_backup="${STATE_DIR}/preexisting_$(basename "$RESTORE_HELPER").$$"
         if [[ -e "$RESTORE_HELPER" ]]; then
             helper_preexisting=true
             RESTORE_HELPER_PREEXISTING=true
@@ -2665,32 +2839,34 @@ EOF
         fi
         local helper_tmp
         helper_tmp="$(mktemp "${RESTORE_HELPER}.XXXXXX")" || die "无法创建恢复脚本"
-        if ! cat > "$helper_tmp" <<EOF
+        # 同 systemd 分支：<<'EOF' + 单 token 占位符，由 inject_helper_values
+        # 注入单引号字面量，避免路径含 $ 时二次展开。
+        if ! cat > "$helper_tmp" <<'EOF'
 #!/bin/bash
 set -u
-CONFIG="$SSHD_CONFIG"
-BACKUP="$BACKUP_FILE"
+CONFIG=@CONFIG@
+BACKUP=@BACKUP@
 MARKER="# ALGO_TEST_ACTIVE_MARKER_DO_NOT_EDIT"
-SERVICE="$SERVICE"
-INITIAL_SERVICE_KNOWN="$INITIAL_SERVICE_KNOWN"
-INITIAL_SERVICE_ACTIVE="$INITIAL_SERVICE_ACTIVE"
-PIDFILE="$PID_FILE"
-AUTH_FILE="$AUTHORIZED_KEYS_FILE"
-HELPER="$RESTORE_HELPER"
-HELPER_BACKUP="$helper_backup"
-HELPER_PREEXISTING="$helper_preexisting"
-AUTH_BACKUP="\${BACKUP}.authkeys"
-AUTH_ADDED="\${BACKUP}.authkeys.added"
-AUTH_ABSENT="\${BACKUP}.authkeys.absent"
-AUTH_ACTIVE="\${BACKUP}.authkeys.active"
-SSHDIR_ABSENT="\${BACKUP}.sshdir.absent"
-SSHDIR_STATE="\${BACKUP}.sshdir.state"
-HOSTKEY_LIST="${GENERATED_HOST_KEYS_FILE}"
-CRYPTO_STATE="${CRYPTO_POLICY_STATE_FILE}"
-AUTO_KEY="${AUTO_KEY}"
-AUTO_PUB="${AUTO_PUB}"
-AUTO_SSH1_KEY="${AUTO_SSH1_KEY}"
-AUTO_SSH1_PUB="${AUTO_SSH1_PUB}"
+SERVICE=@SERVICE@
+INITIAL_SERVICE_KNOWN=@INITIAL_SERVICE_KNOWN@
+INITIAL_SERVICE_ACTIVE=@INITIAL_SERVICE_ACTIVE@
+PIDFILE=@PIDFILE@
+AUTH_FILE=@AUTH_FILE@
+HELPER=@HELPER@
+HELPER_BACKUP=@HELPER_BACKUP@
+HELPER_PREEXISTING=@HELPER_PREEXISTING@
+AUTH_BACKUP="${BACKUP}.authkeys"
+AUTH_ADDED="${BACKUP}.authkeys.added"
+AUTH_ABSENT="${BACKUP}.authkeys.absent"
+AUTH_ACTIVE="${BACKUP}.authkeys.active"
+SSHDIR_ABSENT="${BACKUP}.sshdir.absent"
+SSHDIR_STATE="${BACKUP}.sshdir.state"
+HOSTKEY_LIST=@HOSTKEY_LIST@
+CRYPTO_STATE=@CRYPTO_STATE@
+AUTO_KEY=@AUTO_KEY@
+AUTO_PUB=@AUTO_PUB@
+AUTO_SSH1_KEY=@AUTO_SSH1_KEY@
+AUTO_SSH1_PUB=@AUTO_SSH1_PUB@
 
 hostkey_file_identity() {
     local file="\$1"
@@ -2798,6 +2974,11 @@ EOF
             log "[恢复] ERROR：无法写入 SysV 自愈脚本"
             return 1
         fi
+        if ! inject_helper_values "$helper_tmp"; then
+            rm -f "$helper_tmp" "$cron_tmp"
+            log "[恢复] ERROR：无法注入自愈脚本变量"
+            return 1
+        fi
         if ! chmod 755 "$helper_tmp" ||
            ! backup_preexisting "$RESTORE_HELPER" ||
            ! mv -f "$helper_tmp" "$RESTORE_HELPER"; then
@@ -2818,9 +2999,14 @@ EOF
     fi
 }
 
-trap 'restore_all; exit 130' INT
-trap 'restore_all; exit 143' TERM
-trap restore_all EXIT
+# 恢复钩子：INT/TERM 保留传统信号退出码（130/143）；EXIT 钩子根据
+# restore_all 的返回码决定最终退出码。restore_all 内部不再 exit，避免
+# 改写调用点已确定的退出码或与 EXIT trap 叠加递归。
+trap 'restore_all || true; exit 130' INT
+trap 'restore_all || true; exit 143' TERM
+# EXIT：保留调用点已确定的退出码；若 restore_all 报告恢复失败，则强制非零，
+# 保证"sshd 未完整恢复"时脚本不会以 0 退出。
+trap 'rc=$?; restore_all || rc=$RESTORE_EXIT_CODE; [[ "$rc" -eq 0 && "$RESTORE_EXIT_CODE" -ne 0 ]] && rc=$RESTORE_EXIT_CODE; exit "$rc"' EXIT
 
 acquire_lock || exit 1
 
@@ -2941,11 +3127,10 @@ should_run() {
         return
     fi
 
-    shopt -s nocasematch
-    [[ "$desc" == *"$ONLY_FILTER"* ]]
-    local r=$?
-    shopt -u nocasematch
-    return "$r"
+    # shopt 是全局设置。在子 shell 里开 nocasematch 做大小写不敏感匹配，
+    # 保证即使中途出错（set -e / 信号）也不会把 nocasematch 泄漏到后续
+    # 逻辑（否则配置匹配、marker 检测等会意外变成大小写不敏感）。
+    ( shopt -s nocasematch; [[ "$desc" == *"$ONLY_FILTER"* ]] )
 }
 
 service_restart() {
@@ -3036,7 +3221,16 @@ read_log_delta() {
     local file="$1" size="$2"
     if [[ "$file" == JOURNAL:* ]]; then
         local unit="${file#JOURNAL:}"
-        journalctl -u "${unit}.service" --since "$TEST_START_TIME" --no-pager -o short-iso 2>/dev/null || true
+        # TEST_START_TIME 通常由调用方 test_one() 以 local 定义并通过 bash
+        # 动态作用域可见。这里显式兜底，避免将来在 test_one 之外调用本函数
+        # 时因 set -u 报 unbound variable；无时间戳时回退到最近 5 分钟。
+        local since="${TEST_START_TIME:-}"
+        [[ -n "$since" ]] || since="$(date -d '5 minutes ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+        if [[ -n "$since" ]]; then
+            journalctl -u "${unit}.service" --since "$since" --no-pager -o short-iso 2>/dev/null || true
+        else
+            journalctl -u "${unit}.service" --no-pager -o short-iso 2>/dev/null || true
+        fi
         return 0
     fi
     [[ -f "$file" ]] || return 0
@@ -3050,7 +3244,8 @@ read_log_delta() {
 }
 
 wait_for_server_log() {
-    local file="$1" size="$2" attempt delta
+    local file="$1" size="$2" delta
+    local attempt
     for attempt in 1 2 3 4 5; do
         delta="$(read_log_delta "$file" "$size")"
         if [[ -n "$delta" ]]; then
@@ -3065,6 +3260,8 @@ wait_for_server_log() {
 wait_for_manual_client() {
     local file="$1" size="$2"
     local max_wait="${MANUAL_WAIT_MAX:-600}"
+    # 预留：手工连接建立后额外等待时长。当前实现未使用该值（检测到连接
+    # 成功即继续），保留以便按需启用；如需生效，请在检测到连接后 sleep。
     local post_detect_wait="${MANUAL_POST_CONNECT_WAIT:-30}"
     local waited=0
     local connected=false
@@ -3072,6 +3269,9 @@ wait_for_manual_client() {
     local acc=""
     local terminal_seen=false
     local journal_seen=0
+    # extra 此前未声明为 local，每次循环赋值都会污染同名全局变量（若外部
+    # 存在该名字会被意外覆盖）。显式声明为局部变量。
+    local extra=""
 
     if [[ -z "$file" ]]; then
         log "警告：未找到服务端日志文件，无法等待外部客户端连接；本项按当前状态记录。"
@@ -3313,7 +3513,10 @@ make_test_config_from_backup() {
         printf '%s\n' '# ALGO_TEST_ACTIVE_MARKER_DO_NOT_EDIT'
         printf '%s\n' "# 测试项: [#${idx}] ${desc}"
         printf '%s\n' "Port ${PORT}"
-        if $AUTO; then
+        # 默认强制只监听回环地址：测试期间会临时放开 PermitRootLogin /
+        # PasswordAuthentication，必须同时收窄监听范围，避免这些弱配置
+        # 对非本机可见。仅当显式 --allow-remote 时才放开（隔离网络专用）。
+        if ! $ALLOW_REMOTE; then
             printf '%s\n' 'ListenAddress 127.0.0.1'
         fi
         if [[ "$proto" == "1" ]]; then
@@ -3487,6 +3690,11 @@ run_auto_ssh1() {
         identity_opt="-o IdentitiesOnly=yes"
     fi
 
+    # 用数组承载可选的 -C 参数，避免 $() 未加引号导致的 word splitting
+    # （SC2046）；直接加引号则会在不需要时传入空参数，故用数组最稳妥。
+    local comp_arg=()
+    [[ "$compression" == "zlib" ]] && comp_arg=(-C)
+
     ssh -vvv -1 \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
@@ -3497,7 +3705,7 @@ run_auto_ssh1() {
         $identity_opt \
         -i "$AUTO_SSH1_KEY" \
         -p "$PORT" \
-        $([[ "$compression" == "zlib" ]] && printf '%s' '-C') \
+        "${comp_arg[@]}" \
         -c "$cipher" \
         "$LOOPBACK_TARGET" true \
         >"$output" 2>&1
