@@ -34,11 +34,11 @@
 # 环境不属于以上任何一类时，脚本不会对系统做任何改动，只打印诊断信息并退出。
 #
 # 用法（四种模式，所有环境画像下都支持）：
-#   sudo ./test_ssh_algorithms_all.sh                # 手动模式（默认，每项测试需手动触发/确认）
-#   sudo ./test_ssh_algorithms_all.sh --auto          # 自动模式（本地回环客户端自动触发）
-#   sudo ./test_ssh_algorithms_all.sh --list          # 只列出当前环境的测试项，不改动系统
-#   sudo ./test_ssh_algorithms_all.sh --only=3        # 只运行编号为 3 的测试项（可与 --auto 组合）
-#   sudo ./test_ssh_algorithms_all.sh --only=blowfish # 只运行描述包含 blowfish 的测试项
+#   sudo ./test_ssh.sh                # 手动模式（默认，每项测试需手动触发/确认）
+#   sudo ./test_ssh.sh --auto          # 自动模式（本地回环客户端自动触发）
+#   sudo ./test_ssh.sh --list          # 只列出当前环境的测试项，不改动系统
+#   sudo ./test_ssh.sh --only=3        # 只运行编号为 3 的测试项（可与 --auto 组合）
+#   sudo ./test_ssh.sh --only=blowfish # 只运行描述包含 blowfish 的测试项
 #
 # 安全提示：
 #   - 运行期间会临时开启 PermitRootLogin yes / PasswordAuthentication yes。
@@ -450,8 +450,13 @@ for arg in "$@"; do
             fi
             ;;
         -h|--help)
-            cat <<'EOF'
-用法: sudo ./test_ssh_algorithms_all.sh [选项]
+            # 取脚本自身的名字，避免重命名后帮助文案与实际不符。
+            # $0 可能带路径（./x.sh、/a/b/x.sh）或被人为 fork 调用，
+            # 故取 basename；取不到时回退到通用名。
+            SELF_NAME="$(basename -- "${0:-test_ssh.sh}" 2>/dev/null)"
+            [[ -n "$SELF_NAME" ]] || SELF_NAME="test_ssh.sh"
+            cat <<EOF
+用法: sudo ./${SELF_NAME} [选项]
 
 选项:
   (无参数)           手动模式（默认，每项测试需手动触发/确认）
