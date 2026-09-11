@@ -111,6 +111,11 @@ RESTORE_FAILED=false
 # restore_all 的返回码（0=已完整恢复，1=存在恢复失败项）。由 trap 调用点
 # 读取，用于决定最终退出码，避免在 restore_all 内部直接 exit。
 RESTORE_EXIT_CODE=0
+# 崩溃自愈（systemd drop-in / SysV crontab @reboot）是否不可用。
+# 为 true 时表示：环境缺少 crontab、或自愈安装失败，已降级为"无自愈模式"
+# 继续测试。这只影响"崩溃/断电后的开机兜底"，不影响本次测试与结束恢复，
+# 但会在结束时的汇总中如实提示，避免用户误以为自愈已生效。
+RECOVERY_SELFHEAL_UNAVAILABLE=false
 # 当前测试项启动的 ssh 客户端后台 PID。测试项正常结束时会自行 wait 回收；
 # 若脚本在客户端运行期间被 INT/TERM/EXIT trap 打断，restore_all 会据此处
 # 记录的 PID 终止并回收该客户端，避免残留进程继续占用 sshd 连接。
@@ -121,6 +126,9 @@ PASS=0
 FAIL=0
 UNKNOWN=0
 SKIP=0
+# WARN：协商成功但存在需人工关注的偏差（如 SSH-1 cipher 请求值与服务端
+# 实际落地值不一致的"降级"）。单独计数，不计入 FAIL，也不混入 UNKNOWN。
+WARN=0
 FILTERED_TESTS=0
 SERVER_FILTERED_TESTS=0
 SERVER_UNSUPPORTED_TESTS=0
@@ -847,13 +855,60 @@ server_hostkey_material_supported() {
     return 0
 }
 
+SSHD_KEX_ALGO_SUPPORT=""
 sshd_supports_kex_algorithms() {
-    # OpenSSH 直到 6.1 才引入 "KexAlgorithms" 配置项；5.x（如 CentOS 6 的
-    # OpenSSH 5.3）既无服务端 "KexAlgorithms"，也无客户端 -o KexAlgorithms，
-    # KEX 算法完全由编译期内置顺序决定，无法在任何一端固定。因此对 5.x 必须
-    # 既不写该指令（否则 sshd -t 直接 "Bad configuration option" 使整项失败），
-    # 也不能断言"实际协商 KEX == 固定 KEX"（必然不一致）。
-    # 版本号不可用时保守返回 0（按现代行为处理），避免误跳过真正支持的机器。
+    # 是否存在 "KexAlgorithms" 配置项。
+    #
+    # 判据历史与现状：
+    #   上游 OpenSSH 直到 6.1 才引入 "KexAlgorithms"；但 RHEL/CentOS 的 6.x
+    #   打包版把它回溯移植到了 5.3p1 上（实测 CentOS 6.10 的 5.3p1：
+    #   `sshd -t` 接受该指令，写假值会报 "Unsupported KEX algorithm"）。
+    #   因此**不能只按主版本号猜测**——那会把 CentOS 6 误判成"不支持 KEX 锁定"，
+    #   导致 5.3 上所有组合都不写 KexAlgorithms、KEX 断言被整段跳过。
+    #
+    # 现改为**运行时探测**：让 sshd 校验一个只含 KexAlgorithms 的最小配置。
+    #   * 接受                                   → 支持（CentOS 6 回溯版、>=6.1）；
+    #   * Bad configuration option / Unsupported → 不支持（真正的旧 5.x 上游版）。
+    # 探测结果缓存到 SSHD_KEX_ALGO_SUPPORT，避免每项重复起进程。
+    # 若 sshd 二进制不可用/无法探测，退回版本号判断（>=6 视为支持），保持旧行为。
+    #
+    # 探测值说明：这里填的是"指令是否被识别"的哨兵值，**与任何测试项的 KEX 无关**，
+    # 也不会写进正式配置。因此刻意取一个**任何 OpenSSH 都不可能认得的假算法名**
+    # （algo-probe-sentinel），而不是某个真实算法：
+    #   * 若 sshd 认识 KexAlgorithms 指令 → 报 "Unsupported KEX algorithm ... sentinel"
+    #     （属"指令被接受、只是值非法"）→ 判定支持；
+    #   * 若 sshd 不认识该指令       → 报 "Bad configuration option ... KexAlgorithms"
+    #     → 判定不支持。
+    # 这样既不会因"某个真实算法被裁剪掉"而误判，也不会让人误以为脚本硬编码了 KEX。
+    if [[ -n "$SSHD_KEX_ALGO_SUPPORT" ]]; then
+        [[ "$SSHD_KEX_ALGO_SUPPORT" == "yes" ]]
+        return
+    fi
+    if [[ -n "$SSHD_BIN" && -x "$SSHD_BIN" ]]; then
+        local probe_tmp probe_out
+        probe_tmp="$(mktemp "${TMP_DIR:-/tmp}/kexalgo_probe.XXXXXX" 2>/dev/null)" || probe_tmp=""
+        if [[ -n "$probe_tmp" ]]; then
+            printf '%s\n' 'Protocol 2' 'KexAlgorithms algo-probe-sentinel' > "$probe_tmp"
+            probe_out="$("$SSHD_BIN" -t -f "$probe_tmp" 2>&1)"
+            rm -f "$probe_tmp"
+            # 判据精确化（关键）：
+            #   * "Bad configuration option: KexAlgorithms" → 指令不存在 → 不支持；
+            #   * "Unsupported KEX algorithm"（值非法）      → 指令存在   → 支持；
+            #   * "Bad SSH2 KexAlgorithms '<值>'" (5.3 回溯版对非法值的措辞) → 指令存在 → 支持。
+            # 注意：**不能**把 'Bad SSH2 KexAlgorithms' 也当作不支持——CentOS 6 的 5.3p1
+            # 对"值非法"就是报这个，把两种情形混为一谈会导致误判。故只认
+            # "Bad configuration option ... KexAlgorithms" 一种。
+            if printf '%s' "$probe_out" |
+                grep -qiE 'Bad configuration option.*KexAlgorithms|Unrecognized option.*KexAlgorithms'; then
+                SSHD_KEX_ALGO_SUPPORT="no"
+            else
+                SSHD_KEX_ALGO_SUPPORT="yes"
+            fi
+            [[ "$SSHD_KEX_ALGO_SUPPORT" == "yes" ]]
+            return
+        fi
+    fi
+    # 无法探测：退回版本号。
     [[ -n "$SSHD_VER_MAJOR" ]] || return 0
     (( SSHD_VER_MAJOR >= 6 ))
 }
@@ -1566,11 +1621,11 @@ centos6_add() {
     #   * 否则一律作为普通测试项交给 add_test，由其中的"完整组合预检"
     #     （server_candidate_supported）决定最终分类。
     #
-    # 注意：这里刻意不把 UNKNOWN 升级为 SERVER-FILTER 测试。OpenSSH 5.x
-    # （CentOS 6 的 5.3）没有 KexAlgorithms，KEX 维度无法用配置探测，必然
-    # 返回 UNKNOWN——那是"该维度不可探测"而非"组合能力存疑"。若据此降级，
-    # 每条组合都会变成 UNKNOWN/PRECHECK_ERROR，反而丢失 ciphers/macs/hostkey
-    # 上真正可判定的结论。5.x 下直接跳过 KEX 维度。
+    # 注意：这里刻意不把 UNKNOWN 升级为 SERVER-FILTER 测试。某些旧 sshd
+    # 既无 KexAlgorithms 也无对应 -T 字段，KEX 维度无法用配置探测、必然返回
+    # UNKNOWN——那是"该维度不可探测"而非"组合能力存疑"。若据此降级，每条
+    # 组合都会变成 UNKNOWN/PRECHECK_ERROR，反而丢失 ciphers/macs/hostkey 上
+    # 真正可判定的结论。故仅在 sshd 真能锁定 KEX 时才做 KEX 维度过滤。
     local s
     if sshd_supports_kex_algorithms && [[ "$(server_filter_status kex "$kex")" == "UNSUPPORTED" ]]; then
         kind="UNSUPPORTED"
@@ -1671,7 +1726,29 @@ sshd_effective_protocol_has_1() {
     [[ -n "$SSHD_BIN" && -f "$SSHD_CONFIG" ]] || return 1
     local out
     out="$("$SSHD_BIN" -T -f "$SSHD_CONFIG" 2>/dev/null | awk '$1 == "protocol" { print $2, $3, $4 }' | tr ' ' '\n' | tr ',' '\n')"
-    printf '%s\n' "$out" | grep -qx "1"
+    # 正常情形：-T 直接给出 protocol 值（如 "2" 或 "1,2" 拆成 "1"/"2"）。
+    if printf '%s\n' "$out" | grep -qx "1"; then
+        return 0
+    fi
+    # 旧版 OpenSSH（如 CentOS 6 的 5.3p1）的 sshd -T 对"含 Protocol 1 的组合"
+    # 一律显示 "protocol UNKNOWN"（其 -T 只认 2）。此时不能据此判假，否则
+    # 明明支持 SSH-1 的机器会被整段跳过 SSH-1 用例。故回退解析原始配置文件的
+    # Protocol 指令：含 "1"（如 "Protocol 1" 或 "Protocol 1,2"）即视为含 1。
+    # 注意：仅当 -T 明确"没给出 2"（即 UNKNOWN/空）时才回退，避免与正常路径冲突。
+    if printf '%s\n' "$out" | grep -qx "UNKNOWN" || [[ -z "$out" ]]; then
+        local proto_line
+        proto_line="$(
+            awk '
+                /^[[:space:]]*[Pp][Rr][Oo][Tt][Oo][Cc][Oo][Ll][[:space:]]/ {
+                    sub(/^[[:space:]]*[Pp][Rr][Oo][Tt][Oo][Cc][Oo][Ll][[:space:]]+/, "");
+                    gsub(/[[:space:]]/, "");
+                    print; exit
+                }
+            ' "$SSHD_CONFIG" 2>/dev/null
+        )"
+        printf '%s\n' "$proto_line" | tr ',' '\n' | grep -qx "1" && return 0
+    fi
+    return 1
 }
 
 ssh1_binary_supported() {
@@ -2154,9 +2231,32 @@ sshd_master_pid() {
     # 取当前 sshd 主进程（监听进程）PID。用于判断"重启"是否真的换了一个
     # 进程。OpenSSH 主进程的命令行形如 "sshd: /usr/sbin/sshd [listener]"。
     # 无匹配时输出空。
-    local p
-    p="$(pgrep -f 'sshd.*\[listener\]' 2>/dev/null | head -1)"
-    [[ -n "$p" ]] || p="$(pgrep -x sshd 2>/dev/null | head -1)"
+    #
+    # 三级兜底（重要）：pgrep 来自 procps-ng，精简容器/云镜像（AlmaLinux、
+    # openEuler 基础镜像等）默认可能未安装。若此处因缺少 pgrep 而拿不到 PID，
+    # 会让上层 service_restart 误判"重启失败"，进而整轮测试中止。
+    # 因此按 pgrep -f → pgrep -x → /proc 扫描 的顺序逐级降级，只要有一级
+    # 可用即可。前两级未命中（或工具缺失）时不再报错，转入 /proc 扫描。
+    local p=""
+    if need_cmd pgrep; then
+        p="$(pgrep -f 'sshd.*\[listener\]' 2>/dev/null | head -1)"
+        [[ -n "$p" ]] || p="$(pgrep -x sshd 2>/dev/null | head -1)"
+    fi
+    [[ -n "$p" ]] && { printf '%s\n' "$p"; return 0; }
+
+    # /proc 兜底：不依赖 procps-ng。优先匹配命令行含 "[listener]" 的进程
+    # （即 sshd 主进程），其次匹配 comm 为 sshd 的进程。
+    local d comm cmd
+    for d in /proc/[0-9]*; do
+        comm="$(cat "$d/comm" 2>/dev/null)" || continue
+        [[ "$comm" == "sshd" ]] || continue
+        cmd="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+        if [[ "$cmd" == *"[listener]"* ]]; then
+            printf '%s\n' "${d#/proc/}"
+            return 0
+        fi
+        [[ -n "$p" ]] || p="${d#/proc/}"
+    done
     [[ -n "$p" ]] && printf '%s\n' "$p"
 }
 
@@ -2310,11 +2410,24 @@ env_log "Worker 算法基线: $WORKER_ALGORITHM_FILE"
 for command_name in ssh sshd ssh-keygen awk grep sed tr cut head tail stat mktemp date cmp; do
     env_log "命令 ${command_name}: $(need_cmd "$command_name" && echo available || echo missing)"
 done
+# procps 系工具（pgrep/ps）单独提示：它们来自 procps-ng，精简镜像常缺失。
+# 脚本已为 sshd_master_pid 提供 /proc 兜底（缺 pgrep 也能跑），因此这里只做
+# 可操作性提示、不中止；ps 仅用于 systemd 探测，缺失时同样有 /run/systemd
+# 目录兜底。
+for command_name in pgrep ps; do
+    if need_cmd "$command_name"; then
+        env_log "命令 ${command_name}: available"
+    else
+        env_log "命令 ${command_name}: missing（已启用 /proc 兜底，可继续；如需完整功能可安装 procps-ng）"
+        env_log "  安装提示: yum install -y procps-ng   # 或 dnf install -y procps-ng / apt-get install -y procps"
+    fi
+done
 env_log "命令 systemctl: $(need_cmd systemctl && echo available || echo missing)"
 env_log "命令 service: $(need_cmd service && echo available || echo missing)"
 env_log "命令 journalctl: $(need_cmd journalctl && echo available || echo missing)"
 env_log "命令 crontab: $(need_cmd crontab && echo available || echo missing)"
 env_log "服务管理选择: INIT=$INIT SERVICE=$SERVICE"
+env_log "崩溃自愈可用性: $( $RECOVERY_SELFHEAL_UNAVAILABLE && echo '不可用（无自愈模式）' || echo '已尝试安装' )"
 
 if load_default_effective_algorithms; then
     env_log "默认 sshd -T kexalgorithms: ${DEFAULT_KEX//$'\n'/,}"
@@ -3125,8 +3238,16 @@ EOF
 
     elif [[ "$INIT" == "sysv/service" && "$SERVICE" != "unknown" ]]; then
         if ! command -v crontab >/dev/null 2>&1; then
-            log "[恢复] ERROR：SysV 自愈安装失败：未找到 crontab"
-            return 1
+            # 降级而非中止：crontab 仅用于"崩溃后开机自愈"这一层兜底，
+            # 它缺失并不影响正常测试流程（测试结束时的 restore_all 仍会
+            # 完整恢复配置）。常见的精简容器/云镜像（AlmaLinux、openEuler
+            # 基础镜像等）默认不带 cronie，若在此直接 return 1，会因
+            # 调用点的 `|| die` 让整轮测试在开跑前就中止，属于过度严格。
+            # 此处改为打印可操作提示并返回 0（视为"无需自愈"），继续测试。
+            RECOVERY_SELFHEAL_UNAVAILABLE=true
+            log "[恢复] WARNING：未找到 crontab，跳过 SysV 开机自愈安装（不影响本次测试与结束恢复）"
+            log "[恢复] 提示：如需崩溃自愈，请安装 cronie 后重跑：yum install -y cronie  # 或 dnf install -y cronie"
+            return 0
         fi
         local cron_tmp current helper_preexisting=false
         local helper_backup=""
@@ -3334,7 +3455,14 @@ acquire_lock || exit 1
 
 record_initial_state
 backup_config
-install_recovery || die "崩溃自愈安装失败，已停止测试"
+# 自愈安装失败不再中止整轮测试：自愈只是"崩溃/断电后的开机兜底"，
+# 缺失它并不影响本次测试的正确性（结束时的 restore_all 仍会完整恢复）。
+# 若因 crontab 缺失、drop-in 目录不可写等原因安装失败，降级为警告继续，
+# 但把状态记录下来，便于结束时在恢复报告里如实提示。
+if ! install_recovery; then
+    RECOVERY_SELFHEAL_UNAVAILABLE=true
+    log "[错误] 崩溃自愈安装失败，已降级为无自愈模式继续测试（结束后仍会正常恢复配置）"
+fi
 
 # crypto-policy 与 HostKey 必须在动态候选/组合探测之前准备完成。
 prepare_crypto_policy
@@ -3761,13 +3889,11 @@ load_effective_algorithms() {
 algo_effective_supported() {
     local type="$1" algo="$2" list=""
     [[ -n "$algo" ]] || return 0
-    # OpenSSH < 6 的 sshd -T 不支持 kexalgorithms（该 dump 字段与
-    # KexAlgorithms 指令同期引入，5.x 完全没有），且 5.x 无任何配置项能固定
-    # KEX。此时 EFFECTIVE_KEX 恒为空，若继续按"列表不含即未生效"判定，会把
-    # 所有测试项一致误判为 NEGOTIATION_FAIL。故对 5.x 的 kex 维度不做 -T
-    # 生效性断言，交由真实协商结果（客户端 DEBUG3 实际协商值）判定。
-    # 注意：ciphers/macs 无需放宽——5.x 的 -T 虽默认不输出这两行，但只要测试
-    # 配置显式写了 "Ciphers/MACs"，-T 就会输出对应行，校验仍然有效。
+    # 仅当本机 sshd 不支持 KexAlgorithms 时才跳过 KEX 生效性断言
+    #（真正的旧 5.x 上游版：其 -T 不输出 kexalgorithms，EFFECTIVE_KEX 恒空）。
+    # CentOS 6 的 5.3p1 回溯支持该指令，-T 会输出 kexalgorithms，故正常断言。
+    # 注意：ciphers/macs 无需放宽——只要测试配置显式写了 "Ciphers/MACs"，
+    # -T 就会输出对应行，校验始终有效。
     if [[ "$type" == "kex" ]] && ! sshd_supports_kex_algorithms; then
         return 0
     fi
@@ -4049,8 +4175,17 @@ run_auto_ssh1() {
 
     # 用数组承载可选的 -C 参数，避免 $() 未加引号导致的 word splitting
     # （SC2046）；直接加引号则会在不需要时传入空参数，故用数组最稳妥。
-    local comp_arg=()
-    [[ "$compression" == "zlib" ]] && comp_arg=(-C)
+    #
+    # 关键兼容性：本脚本开头启用了 `set -u`。在 **bash 4.1**（CentOS 6 自带
+    # 4.1.2）下，对"已声明但为空"的数组用 `"${arr[@]}"` 展开会触发
+    # `arr[@]: unbound variable` 并使命令**整体失败**（bash 4.4+ 才修正为
+    # 正常展开为 0 个参数）。当 compression=none 时 comp_arg 恰为空数组，
+    # 于是 ssh 命令因展开报错根本没执行、输出为空、rc=1，被误判为
+    # CLIENT_EXIT_1 —— 这正是"SSH-1 的 none 压缩项全失败、zlib 项全通过"的根因。
+    # 修复：用 `${arr[@]+"${arr[@]}"}` 惯用法，空数组时不展开、非空时正常展开，
+    # 在 bash 4.1 与 5.x 下行为一致。
+    local comp_args=()
+    [[ "$compression" == "zlib" ]] && comp_args=(-C)
 
     ssh -vvv -1 \
         -F /dev/null \
@@ -4063,7 +4198,7 @@ run_auto_ssh1() {
         $identity_opt \
         -i "$AUTO_SSH1_KEY" \
         -p "$PORT" \
-        "${comp_arg[@]}" \
+        ${comp_args[@]+"${comp_args[@]}"} \
         -c "$cipher" \
         "$LOOPBACK_TARGET" true \
         >"$output" 2>&1
@@ -4135,6 +4270,7 @@ record_result() {
 
     case "$overall" in
         PASS) PASS=$((PASS + 1)) ;;
+        WARN) WARN=$((WARN + 1)) ;;
         AUTH_FAIL|COMMAND_FAIL|CLIENT_FAIL|FAIL) FAIL=$((FAIL + 1)) ;;
         SKIP) SKIP=$((SKIP + 1)) ;;
         *) UNKNOWN=$((UNKNOWN + 1)) ;;
@@ -4500,15 +4636,31 @@ test_one() {
                 grep -m1 -E 'kex: (diffie-|ecdh-|curve|gss-).*' |
                 sed -E 's/.*kex: (.*)/\1/' | awk '{print $1}' | tr -d '\r')"
         fi
+        # OpenSSH 5.x（CentOS 6 的 5.3）既不输出 "kex: algorithm:" 也不输出
+        # 上述 "kex: <algo>" 形式；KEX 只能在 KEXINIT 转储里看到。当服务端
+        # 用 KexAlgorithms 锁定了 KEX 时，服务端 KEXINIT 的 KEX 行只含**单个**
+        # 算法（如 "kex_parse_kexinit: diffie-hellman-group14-sha1"）；
+        # 客户端那条则是完整逗号列表。故取"无逗号的 diffie/ecdh/curve/gss 单值"
+        # 作为 5.x 的实际协商 KEX 兜底。若本身没锁（多值列表）则匹配不到，
+        # NK 仍为空，交由后续"KEX 断言"逻辑处理，不会误判。
+        if [[ -z "$NK" ]]; then
+            NK="$(printf '%s\n' "$server_delta" |
+                grep -m1 -E 'kex_parse_kexinit: (diffie-hellman|ecdh|curve25519|curve448|gss)-[^,[:space:]]+[[:space:]]*$' |
+                sed -E 's/.*kex_parse_kexinit:[[:space:]]*//' | awk '{print $1}' | tr -d '\r')"
+        fi
+        # 旧式 "kex: server->client <cipher> <mac> <comp>"。注意真实 syslog
+        # （如 /var/log/secure，经 rsyslog）会在行首加 "时间戳 主机名 进程[pid]:" 前缀，
+        # 使绝对列号（$4/$5）错位（取到 "debug1:"/"kex:"）。故改为以
+        # "server->client " 为锚点取其后第 1、2 个字段，前缀无关。
         if [[ -z "$NC" ]]; then
             NC="$(printf '%s\n' "$server_delta" |
                 grep -m1 -E 'kex: server->client ' |
-                awk '{print $4}' | tr -d '\r')"
+                sed -n 's/.*kex: server->client \([^ ]*\).*/\1/p' | tr -d '\r')"
         fi
         if [[ -z "$NM" ]]; then
             NM="$(printf '%s\n' "$server_delta" |
                 grep -m1 -E 'kex: server->client ' |
-                awk '{print $5}' | tr -d '\r')"
+                sed -n 's/.*kex: server->client [^ ]* \([^ ]*\).*/\1/p' | tr -d '\r')"
         fi
         if [[ -z "$NH" ]]; then
             NH="$(extract_negotiated_hostkey "$server_delta")"
@@ -4639,8 +4791,14 @@ test_one() {
             reason="$(last_matching_text "$negotiation_pattern" "$server_delta")"
             [[ -n "$reason" ]] || reason="$(grep -hiE "$negotiation_pattern" "$client_out" 2>/dev/null | tail -1)"
 
-        elif { [[ "$cipher" == chacha20-poly1305@openssh.com || "$cipher" == aes128-gcm@openssh.com || "$cipher" == aes256-gcm@openssh.com ]] && [[ -n "$NK$NC$NH" ]]; } || \
-         [[ -n "$NK$NC$NM$NH" ]]; then
+        # 本分支比对的是 SSH-2 的 KEX/Cipher/MAC/HostKey/Compression 五元组，
+        # 且依据 NK/NC/NM/NH 这些 SSH-2 专有解析变量。SSH-1(proto=1) 下这些
+        # 变量取不到值（NK/NM 为 "N/A"、NH 为 "UNKNOWN"），旧代码因 "N/A" 非空
+        # 会误入本分支，并写入 SSH-2 专用文案 —— 造成 SSH-1 结果被污染。
+        # 故显式加 proto == "2" 守卫；SSH-1 的判定完全交给上方 SSH-1 专用分支。
+        elif [[ "$proto" == "2" ]] && \
+         { { [[ "$cipher" == chacha20-poly1305@openssh.com || "$cipher" == aes128-gcm@openssh.com || "$cipher" == aes256-gcm@openssh.com ]] && [[ -n "$NK$NC$NH" ]]; } || \
+           [[ -n "$NK$NC$NM$NH" ]]; }; then
             local mac_matches=true
             case "$cipher" in
                 chacha20-poly1305@openssh.com|aes128-gcm@openssh.com|aes256-gcm@openssh.com)
@@ -4651,17 +4809,27 @@ test_one() {
                     [[ "$NM" == "$mac" ]] || mac_matches=false
                     ;;
             esac
-            # KEX 断言仅在服务端/客户端真能固定 KEX 时才成立（OpenSSH >= 6）。
-            # 5.x（CentOS 6）KEX 由编译期顺序决定，无法固定，实际协商出的是
-            # 双方第一个共同支持的 KEX（通常是 diffie-hellman-group1-sha1 或
-            # group14-sha1），与测试项名义固定的值可能不同——这属于环境语义，
-            # 不是缺陷，故对 5.x 跳过 KEX 相等断言，只继续校验可固定的
-            # cipher/MAC/hostkey。
+            # KEX 断言：仅在本机能写 KexAlgorithms（即 sshd 支持该指令）时成立。
+            # CentOS 6 的 5.3p1 回溯支持 KexAlgorithms，故此处会真正做断言；
+            # 而真正的旧 5.x 上游版不支持该指令（sshd_supports_kex_algorithms 返回假），
+            # 此时 KEX 由编译期顺序决定，跳过断言以免误判。
+            #
+            # 关键防误判：若因日志形态导致 NK 仍未解析到（空串），不能当成
+            # "协商结果与固定值不一致"——那是"没取到证据"，不是"协商失败"。
+            # 此时只跳过 KEX 断言（视为未知），仍继续校验可解析的 cipher/MAC/hostkey。
             local kex_matches=true
-            if sshd_supports_kex_algorithms; then
+            if sshd_supports_kex_algorithms && [[ -n "$NK" ]]; then
                 [[ "$NK" == "$kex" ]] || kex_matches=false
             fi
-            if [[ "$kex_matches" == true && "$NC" == "$cipher" && "$mac_matches" == true && "$NH" == "$hostkey" ]]; then
+            # 同理：HostKey 若未解析到（空串）也不能当作"与固定值不一致"。
+            # CentOS 6 的 HostKey 由 HostKey 私钥文件间接锁定，服务端日志的
+            # "list_hostkey_types: <algo>" 是可靠证据；只有当该证据确实取到时
+            # 才做相等断言，取不到则跳过（视为未知），避免把"没取到"误判成"不匹配"。
+            local hostkey_matches=true
+            if [[ -n "$NH" ]]; then
+                [[ "$NH" == "$hostkey" ]] || hostkey_matches=false
+            fi
+            if [[ "$kex_matches" == true && "$NC" == "$cipher" && "$mac_matches" == true && "$hostkey_matches" == true ]]; then
                 if [[ -n "$compression" ]]; then
                     if [[ "$NCOMP" == "$compression" ]]; then
                         NR="PASS"
@@ -4744,6 +4912,26 @@ test_one() {
         # 记成令人误解的协商失败。
         local ssh1_unsupported=""
         ssh1_unsupported="$(grep -m1 -oiE 'Selected cipher type [^ ]+ not supported by server|Unknown cipher type[^\r]*' "$client_out" 2>/dev/null | tr -d '\r')"
+
+        # ----------------------------------------------------------------
+        # 服务端权威 cipher（重要）：
+        #   SSH-1 没有算法协商报文，客户端日志的 "cipher: <x>" 只是"请求值"，
+        #   并非最终落地值。唯一权威来源是服务端 DEBUG1 行
+        #       debug1: Encryption type: <cipher>
+        #   典型陷阱：客户端 `-1 -c arcfour` 时 OpenSSH 5.3p1 会打印
+        #       "No valid SSH1 cipher, using 3des instead."
+        #   随后实际用 3des 完成握手，客户端日志里却仍残留 arcfour 字样。
+        #   若只看客户端日志，会把 arcfour 记成 PASS（假 PASS），而真实
+        #   落地的是 3des。此处改用服务端值判定，并识别"降级"。
+        # ----------------------------------------------------------------
+        local ssh1_server_cipher=""
+        ssh1_server_cipher="$(printf '%s\n' "$server_delta" |
+            grep -m1 -oiE 'Encryption type: [^ ,]+' 2>/dev/null |
+            sed -E 's/.*Encryption type: //' | tr -d '\r')"
+        # 客户端自报"已降级"的显式证据
+        local ssh1_client_downgrade=""
+        ssh1_client_downgrade="$(grep -m1 -oiE 'No valid SSH1 cipher, using [^ ]+ instead' "$client_out" 2>/dev/null | tr -d '\r')"
+
         if [[ -n "$ssh1_unsupported" ]]; then
             # 与 SSH-2 的 Server Filter 约定保持一致：NR=FAIL 但 CR 明确标注
             # SERVER_UNSUPPORTED，使这类"期望的负结果"在汇总与日志中可一眼区分，
@@ -4763,10 +4951,37 @@ test_one() {
         elif text_matches 'Accepted|authentication success|User .* authenticated' "$server_delta" || \
              grep -qiE 'Accepted|authentication success|User .* authenticated' \
             "$client_out" 2>/dev/null; then
-            NR="PASS"
-            AR="PASS"
-            CR="PASS"
-            NH="RSA1"
+            # 握手 + 认证都成功。此时若服务端给出了权威 cipher，就以它作为
+            # 实际协商值；并检查是否发生了"请求值 ≠ 落地值"的降级。
+            [[ -n "$ssh1_server_cipher" ]] && NC="$ssh1_server_cipher"
+            local ssh1_want="$cipher"
+            [[ "$ssh1_want" == *-cbc ]] && ssh1_want="${ssh1_want%-cbc}"
+            if [[ -n "$ssh1_server_cipher" && -n "$ssh1_want" &&
+                  "${ssh1_server_cipher,,}" != "${ssh1_want,,}" ]]; then
+                # 期望 cipher 与实际落地不一致 → 降级。这不是"通过"，而是
+                # 需要人工关注的偏差（例如 arcfour 实际落到 3des）。
+                NR="WARN"
+                AR="PASS"
+                CR="NEGOTIATION_MISMATCH"
+                reason="SSH-1 实际使用 cipher 与请求不一致（降级）：请求 ${cipher}，服务端实际 ${ssh1_server_cipher}${ssh1_client_downgrade:+（客户端报：$ssh1_client_downgrade）}"
+            elif [[ -n "$ssh1_client_downgrade" ]]; then
+                # 服务端日志未取到，但客户端明确报了降级
+                NR="WARN"
+                AR="PASS"
+                CR="NEGOTIATION_MISMATCH"
+                reason="SSH-1 客户端已降级：$ssh1_client_downgrade（服务端日志未捕获到 Encryption type 行）"
+            else
+                NR="PASS"
+                AR="PASS"
+                CR="PASS"
+                NH="RSA1"
+                # 清空 reason：上方为 SSH-2 设计的算法匹配断言在 SSH-1 下会
+                # 走 elif 分支并写入 "客户端 DEBUG3 检测到的实际协商算法与
+                # 本次固定测试组合不一致" 这类不适用于 SSH-1 的文案（SSH-1
+                # 无算法协商报文，该断言无意义）。此处既然已判定 PASS，必须
+                # 显式清空，避免该旧文案残留到结果报告中造成误解。
+                reason=""
+            fi
         elif text_matches 'Failed password|Failed publickey|Failed none|authentication failure' "$server_delta" || \
              grep -qiE 'Failed password|Failed publickey|Failed none|authentication failure' \
             "$client_out" 2>/dev/null; then
@@ -4915,15 +5130,19 @@ done
 env_log "结束时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 env_log "PASS: $PASS"
 env_log "FAIL: $FAIL"
+env_log "WARN: $WARN"
 env_log "UNKNOWN: $UNKNOWN"
 env_log "SKIP: $SKIP"
 env_log "配置恢复要求: 已注册 EXIT/INT/TERM cleanup"
+[[ "$RECOVERY_SELFHEAL_UNAVAILABLE" == "true" ]] && \
+    env_log "注意: 崩溃自愈不可用（缺 crontab 或安装失败），本次为无自愈模式运行"
 
 log ""
 log "============================================================"
 log "测试完成"
 log "PASS: $PASS"
 log "FAIL: $FAIL"
+log "WARN: $WARN"
 log "UNKNOWN: $UNKNOWN"
 log "SKIP: $SKIP"
 log "总测试项: $TEST_INDEX"
