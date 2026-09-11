@@ -129,6 +129,13 @@ SKIP=0
 # WARN：协商成功但存在需人工关注的偏差（如 SSH-1 cipher 请求值与服务端
 # 实际落地值不一致的"降级"）。单独计数，不计入 FAIL，也不混入 UNKNOWN。
 WARN=0
+# 结论摘要辅助计数（见 record_result 与末尾"结论摘要"区）：
+#   NOT_RUN_TOTAL    —— ER=NOT_RUN，从未真正执行的项（预检即判负）
+#   UNSUPPORTED_FAIL —— 其中因服务端/客户端不支持而判 FAIL 的项（预期负结果）
+NOT_RUN_TOTAL=0
+UNSUPPORTED_FAIL=0
+# 非 PASS 项一览表缓存（见 record_result 与末尾摘要区）
+NOTPASS_LINES=()
 FILTERED_TESTS=0
 SERVER_FILTERED_TESTS=0
 SERVER_UNSUPPORTED_TESTS=0
@@ -280,13 +287,13 @@ prepare_host_keys() {
                 printf '%s\t%s\t%s\n' "$path" "$private_id" "$public_id" >> "$GENERATED_HOST_KEYS_FILE" || true
                 chmod 600 "$GENERATED_HOST_KEYS_FILE" 2>/dev/null || true
                 if [[ -z "$private_id" || -z "$public_id" ]]; then
-                    env_log "WARNING：无法保存 HostKey 身份，恢复时将拒绝删除该文件：$path"
+                    env_log "警告：无法保存 HostKey 身份，恢复时将拒绝删除该文件：$path"
                 fi
             fi
             env_log "本次测试新生成 HostKey: $path"
         else
             rm -f "$path" "${path}.pub"
-            env_log "WARNING：HostKey 生成失败，已清理半成品：$path"
+            env_log "警告：HostKey 生成失败，已清理半成品：$path"
         fi
     done
 }
@@ -406,7 +413,7 @@ crypto_policy_relax_for_test() {
             ;;
     esac
 
-    log "Temporarily switching crypto policy from '$INITIAL_CRYPTO_POLICY' to 'LEGACY' for capability test"
+    log "为能力测试临时切换加密策略：从 '$INITIAL_CRYPTO_POLICY' 切换到 'LEGACY'"
     if "$CRYPTO_POLICY_TOOL" --set LEGACY >/dev/null 2>&1; then
         CRYPTO_POLICY_CHANGED=true
         # 记录本脚本实际写入的值。恢复时必须精确比对"当前值 == 我写入的值"，
@@ -427,7 +434,7 @@ crypto_policy_relax_for_test() {
         return 0
     fi
 
-    warn "Unable to switch crypto policy to LEGACY; continuing with the original policy"
+    warn "无法将加密策略切换为 LEGACY；继续使用原策略"
     return 1
 }
 
@@ -614,7 +621,7 @@ detect_env() {
                 SERVICE="ssh"
             fi
         else
-            env_log "systemctl 存在但 systemd PID1 不可用，回退到 SysV service"
+            env_log "systemctl 存在但 systemd 的 PID1 不可用，回退到 SysV service 方式"
         fi
     fi
     if [[ "$INIT" == "unknown" ]] && command -v service >/dev/null 2>&1; then
@@ -1152,11 +1159,11 @@ add_test() {
     case "$server_filter_class" in
         UNSUPPORTED)
             precheck_status="UNSUPPORTED"
-            precheck_reason="Server Filter 判定为 UNSUPPORTED：服务器不支持该算法"
+            precheck_reason="服务端预筛判定为 UNSUPPORTED：服务端不支持该算法"
             ;;
         UNKNOWN/PRECHECK_ERROR)
             precheck_status="UNKNOWN"
-            precheck_reason="Server Filter 判定为 UNKNOWN/PRECHECK_ERROR：服务器能力或预检不可确认"
+            precheck_reason="服务端预筛判定为 UNKNOWN/PRECHECK_ERROR：服务端能力或预检不可确认"
             ;;
     esac
 
@@ -1652,7 +1659,7 @@ centos6_add() {
     # （add_test "$@" "none"）会把空串当成已有的第 8 参、再把 "none" 追加为
     # 第 9 参，导致第 8 参永远是空串而无限递归（表现为段错误/爆栈）。
     if [[ "$kind" == "UNSUPPORTED" ]]; then
-        env_log "SERVER-FILTER：$desc 含服务器不支持的算法，记为 UNSUPPORTED"
+        env_log "服务端预筛：$desc 含服务端不支持的算法，记为 UNSUPPORTED（服务端不支持）"
         if [[ -n "$compression" ]]; then
             add_test "SERVER-FILTER UNSUPPORTED: $desc" \
                 "$kex" "$cipher" "$mac" "$hostkey" "SERVER-FILTER/UNSUPPORTED" 2 "$compression"
@@ -2148,11 +2155,11 @@ if $LIST_ONLY; then
     log "========================================"
     log "统一 SSH 算法协商测试项"
     log "环境：${OS_PRETTY}"
-    log "OpenSSH：${SSH_VERSION_STR:-unknown}"
-    log "Profile：${PROFILE}"
+    log "OpenSSH：${SSH_VERSION_STR:-未知}"
+    log "环境画像 Profile：${PROFILE}"
     log "========================================"
-    log "列说明：default_supported=当前默认配置(sshd -T)是否已启用该算法"
-    log "       （no 表示默认未启用但能力测试仍入选；n/a 用于 SSH-1）"
+    log "列说明：默认配置支持=当前默认配置(sshd -T)是否已启用该算法"
+    log "       （no（否）表示默认未启用但能力测试仍入选；n/a（不适用）用于 SSH-1）"
     log "========================================"
     i=0
     for d in "${DESCS[@]}"; do
@@ -2398,22 +2405,22 @@ env_log "SSH 算法协商测试 - 环境/执行信息"
 env_log "开始时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 env_log "当前目录: $BASE_DIR"
 env_log "系统: $OS_PRETTY"
-env_log "OS_ID: $OS_ID"
-env_log "OS_VERSION_ID: $OS_VERSION_ID"
+env_log "系统标识 OS_ID: $(show_os_id "$OS_ID")"
+env_log "系统版本 OS_VERSION_ID: ${OS_VERSION_ID:-未知}"
 env_log "SSH 客户端版本: $SSH_VERSION_STR"
 env_log "SSHD 版本: $SSHD_VER"
 env_log "SSHD 路径: ${SSHD_BIN:-未找到}"
-env_log "SSHD 主版本: ${SSHD_VER_MAJOR:-unknown}"
-env_log "SSH 主版本: ${SSH_VER:-unknown}"
+env_log "SSHD 主版本: ${SSHD_VER_MAJOR:-未知}"
+env_log "SSH 主版本: ${SSH_VER:-未知}"
 env_log "服务: $SERVICE"
 env_log "初始化系统: $INIT"
 env_log "测试端口: $PORT"
-env_log "测试模式: $($AUTO && echo auto || echo manual)"
+env_log "测试模式: $($AUTO && echo '自动模式（auto）' || echo '手动模式（manual）')"
 env_log "筛选: ${ONLY_FILTER:-全部}"
-env_log "Profile: $PROFILE"
-env_log "Worker 算法基线: $WORKER_ALGORITHM_FILE"
+env_log "环境画像 Profile: $PROFILE"
+env_log "客户端算法基线: $WORKER_ALGORITHM_FILE"
 for command_name in ssh sshd ssh-keygen awk grep sed tr cut head tail stat mktemp date cmp; do
-    env_log "命令 ${command_name}: $(need_cmd "$command_name" && echo available || echo missing)"
+    env_log "命令 ${command_name}: $(need_cmd "$command_name" && echo 'available（可用）' || echo 'missing（缺失）')"
 done
 # procps 系工具（pgrep/ps）单独提示：它们来自 procps-ng，精简镜像常缺失。
 # 脚本已为 sshd_master_pid 提供 /proc 兜底（缺 pgrep 也能跑），因此这里只做
@@ -2421,17 +2428,17 @@ done
 # 目录兜底。
 for command_name in pgrep ps; do
     if need_cmd "$command_name"; then
-        env_log "命令 ${command_name}: available"
+        env_log "命令 ${command_name}: available（可用）"
     else
-        env_log "命令 ${command_name}: missing（已启用 /proc 兜底，可继续；如需完整功能可安装 procps-ng）"
+        env_log "命令 ${command_name}: missing（缺失）（已启用 /proc 兜底，可继续；如需完整功能可安装 procps-ng）"
         env_log "  安装提示: yum install -y procps-ng   # 或 dnf install -y procps-ng / apt-get install -y procps"
     fi
 done
-env_log "命令 systemctl: $(need_cmd systemctl && echo available || echo missing)"
-env_log "命令 service: $(need_cmd service && echo available || echo missing)"
-env_log "命令 journalctl: $(need_cmd journalctl && echo available || echo missing)"
-env_log "命令 crontab: $(need_cmd crontab && echo available || echo missing)"
-env_log "服务管理选择: INIT=$INIT SERVICE=$SERVICE"
+env_log "命令 systemctl: $(need_cmd systemctl && echo 'available（可用）' || echo 'missing（缺失）')"
+env_log "命令 service: $(need_cmd service && echo 'available（可用）' || echo 'missing（缺失）')"
+env_log "命令 journalctl: $(need_cmd journalctl && echo 'available（可用）' || echo 'missing（缺失）')"
+env_log "命令 crontab: $(need_cmd crontab && echo 'available（可用）' || echo 'missing（缺失）')"
+env_log "服务管理选择: 初始化系统=$INIT 服务名=$SERVICE"
 env_log "崩溃自愈可用性: $( $RECOVERY_SELFHEAL_UNAVAILABLE && echo '不可用（无自愈模式）' || echo '已尝试安装' )"
 
 if load_default_effective_algorithms; then
@@ -2442,7 +2449,7 @@ if load_default_effective_algorithms; then
     env_log "默认 sshd -T hostkeyalgorithms: ${DEFAULT_HOSTKEY_ALGORITHMS//$'\n'/,}"
     env_log "默认 sshd -T compression: ${DEFAULT_COMPRESSION:-unknown}"
 else
-    env_log "WARNING：无法读取默认 sshd -T 有效配置"
+    env_log "警告：无法读取默认 sshd -T 有效配置"
 fi
 
 # ============================================================
@@ -2504,57 +2511,57 @@ verify_restored_state() {
 
     if [[ -n "$SSHD_BIN" ]]; then
         if "$SSHD_BIN" -t -f "$SSHD_CONFIG" >/dev/null 2>&1; then
-            log "[恢复验证] sshd_config: PASS"
+            log "[恢复验证] 服务端配置: PASS（通过）"
         else
             cfg_ok=false
-            log "[恢复验证] sshd_config: FAIL（sshd -t 失败）"
+            log "[恢复验证] 服务端配置: FAIL（sshd -t 失败）"
         fi
     else
         cfg_ok=false
-        log "[恢复验证] sshd_config: UNKNOWN（未找到 sshd）"
+        log "[恢复验证] 服务端配置: UNKNOWN（未找到 sshd）"
     fi
 
     if $INITIAL_SERVICE_KNOWN; then
         if $INITIAL_SERVICE_ACTIVE; then
             if service_is_up; then
-                log "[恢复验证] service state: PASS（运行）"
+                log "[恢复验证] 服务状态: PASS（运行）"
             else
                 svc_ok=false
-                log "[恢复验证] service state: FAIL（应运行但未运行）"
+                log "[恢复验证] 服务状态: FAIL（应运行但未运行）"
             fi
         else
             if service_is_up; then
                 svc_ok=false
-                log "[恢复验证] service state: FAIL（应停止但仍运行）"
+                log "[恢复验证] 服务状态: FAIL（应停止但仍运行）"
             else
-                log "[恢复验证] service state: PASS（停止）"
+                log "[恢复验证] 服务状态: PASS（停止）"
             fi
         fi
     else
-        log "[恢复验证] service state: UNKNOWN（测试前服务状态未知）"
+        log "[恢复验证] 服务状态: UNKNOWN（测试前服务状态未知）"
     fi
 
     if $CRYPTO_POLICY_CHANGED && command -v update-crypto-policies >/dev/null 2>&1 && [[ -n "$INITIAL_CRYPTO_POLICY" ]]; then
         local final_crypto
         final_crypto="$(update-crypto-policies --show 2>/dev/null || true)"
         if [[ "$final_crypto" == "$INITIAL_CRYPTO_POLICY" ]]; then
-            log "[恢复验证] crypto-policy: PASS ($final_crypto)"
+            log "[恢复验证] 加密策略: PASS（通过） ($final_crypto)"
         else
             crypto_ok=false
-            log "[恢复验证] crypto-policy: FAIL（当前='$final_crypto'，期望='$INITIAL_CRYPTO_POLICY'）"
+            log "[恢复验证] 加密策略: FAIL（当前='$final_crypto'，期望='$INITIAL_CRYPTO_POLICY'）"
         fi
     fi
 
     if [[ -f "${BACKUP_FILE}.authkeys.added" ]]; then
         if [[ ! -e "$AUTHORIZED_KEYS_FILE" ]] ||
            ! grep -Fxf "${BACKUP_FILE}.authkeys.added" "$AUTHORIZED_KEYS_FILE" >/dev/null 2>&1; then
-            log "[恢复验证] authorized_keys: PASS（测试行已移除，外部修改保留）"
+            log "[恢复验证] 授权密钥文件: PASS（测试行已移除，外部修改保留）"
         else
             auth_ok=false
-            log "[恢复验证] authorized_keys: FAIL（测试行仍存在）"
+            log "[恢复验证] 授权密钥文件: FAIL（测试行仍存在）"
         fi
     elif [[ -f "${BACKUP_FILE}.authkeys.absent" && ! -e "$AUTHORIZED_KEYS_FILE" ]]; then
-        log "[恢复验证] authorized_keys: PASS（测试前不存在）"
+        log "[恢复验证] 授权密钥文件: PASS（测试前不存在）"
     fi
 
     if [[ "$SSH_DIR_WAS_ABSENT" == true ]]; then
@@ -2568,7 +2575,7 @@ verify_restored_state() {
         local final_mode
         final_mode="$(stat -c %a /root/.ssh 2>/dev/null || stat -f %Lp /root/.ssh 2>/dev/null || true)"
         if [[ "$final_mode" == "$SSH_DIR_MODE_BEFORE" ]]; then
-            log "[恢复验证] /root/.ssh mode: PASS ($final_mode)"
+            log "[恢复验证] /root/.ssh mode: PASS（通过） ($final_mode)"
         else
             sshdir_ok=false
             log "[恢复验证] /root/.ssh mode: FAIL（当前='$final_mode'，期望='$SSH_DIR_MODE_BEFORE'）"
@@ -2585,20 +2592,20 @@ verify_restored_state() {
                 if [[ "$_current_private_id" == "$_private_id" &&
                       "$_current_public_id" == "$_public_id" ]]; then
                     hostkeys_ok=false
-                    log "[恢复验证] HostKey cleanup: FAIL（仍存在 $_hk）"
+                    log "[恢复验证] 主机密钥清理: FAIL（仍存在 $_hk）"
                 else
-                    log "[恢复验证] HostKey cleanup: PASS（身份变化，保留外部替换 $_hk）"
+                    log "[恢复验证] 主机密钥清理: PASS（身份变化，保留外部替换 $_hk）"
                 fi
             fi
         done < "$GENERATED_HOST_KEYS_FILE"
     fi
-    $hostkeys_ok && log "[恢复验证] HostKey cleanup: PASS"
+    $hostkeys_ok && log "[恢复验证] 主机密钥清理: PASS（通过）"
 
     if find "$TMP_DIR" -maxdepth 1 -type f \( -name 'algo_client.*' -o -name 'algo_sshd_t.*' -o -name 'ssh_algo_probe.*' -o -name 'ssh_algo_single.*' -o -name 'ssh1probe.*' \) -print -quit 2>/dev/null | grep -q .; then
         temp_ok=false
-        log "[恢复验证] temporary files: FAIL（发现测试临时文件）"
+        log "[恢复验证] 临时文件: FAIL（发现测试临时文件）"
     else
-        log "[恢复验证] temporary files: PASS（CLEAN）"
+        log "[恢复验证] 临时文件: PASS（CLEAN）"
     fi
 
     if $cfg_ok && $svc_ok && $crypto_ok && $temp_ok && $auth_ok && $sshdir_ok && $hostkeys_ok; then
@@ -2656,13 +2663,13 @@ restore_all() {
         elif [[ -f "${BACKUP_FILE}.authkeys.added" ]]; then
             log "[恢复] authorized_keys 当前不存在，测试行已自然清理"
         elif [[ -f "${BACKUP_FILE}.authkeys" ]]; then
-            log "[恢复] WARNING：缺少测试行清单，保留 authorized_keys，未整体覆盖外部修改"
+            log "[恢复] 警告：缺少测试行清单，保留 authorized_keys，未整体覆盖外部修改"
         elif [[ -f "${BACKUP_FILE}.authkeys.absent" && ! -e "$AUTHORIZED_KEYS_FILE" ]]; then
             log "[恢复] authorized_keys 已恢复为测试前不存在状态"
         elif [[ -f "${BACKUP_FILE}.authkeys.absent" ]]; then
-            log "[恢复] WARNING：authorized_keys 含外部内容，保留文件而不整体删除"
+            log "[恢复] 警告：authorized_keys 含外部内容，保留文件而不整体删除"
         else
-            log "[恢复] WARNING：无 authorized_keys 恢复元数据，保留当前文件"
+            log "[恢复] 警告：无 authorized_keys 恢复元数据，保留当前文件"
         fi
         if [[ -f "${BACKUP_FILE}.authkeys.added" ]] &&
            [[ -e "$AUTHORIZED_KEYS_FILE" ]] &&
@@ -2729,7 +2736,7 @@ restore_all() {
             log "[恢复] sshd_config 与备份一致，确认已恢复（无需再次覆盖）"
         else
             # 情形 C：被外部修改
-            log "[恢复] WARNING：sshd_config 已被外部修改（不含测试 marker），跳过恢复以避免覆盖外部修改；保留恢复依据"
+            log "[恢复] 警告：sshd_config 已被外部修改（不含测试 marker），跳过恢复以避免覆盖外部修改；保留恢复依据"
             RESTORE_FAILED=true
         fi
     else
@@ -2755,7 +2762,7 @@ restore_all() {
                     RESTORE_FAILED=true
                 fi
             elif [[ -e "$hk" || -e "${hk}.pub" ]]; then
-                log "[恢复] WARNING：HostKey 身份已变化，跳过删除以保护外部替换：$hk"
+                log "[恢复] 警告：HostKey 身份已变化，跳过删除以保护外部替换：$hk"
             fi
         done < "$GENERATED_HOST_KEYS_FILE"
     fi
@@ -2773,7 +2780,7 @@ restore_all() {
                 RESTORE_FAILED=true
             fi
         else
-            log "[恢复] WARNING：crypto-policy 当前为 '$current_crypto'，不是本脚本设置的 '$CRYPTO_POLICY_APPLIED'；跳过恢复，避免覆盖其他进程的修改"
+            log "[恢复] 警告：crypto-policy 当前为 '$current_crypto'，不是本脚本设置的 '$CRYPTO_POLICY_APPLIED'；跳过恢复，避免覆盖其他进程的修改"
         fi
     fi
 
@@ -2860,7 +2867,7 @@ restore_all() {
             fi
         fi
     else
-        log "[恢复] WARNING：未确认 sshd_config 已恢复，保留 backup/state/helper/drop-in"
+        log "[恢复] 警告：未确认 sshd_config 已恢复，保留 backup/state/helper/drop-in"
     fi
 
     if ! verify_restored_state; then
@@ -3250,7 +3257,7 @@ EOF
             # 调用点的 `|| die` 让整轮测试在开跑前就中止，属于过度严格。
             # 此处改为打印可操作提示并返回 0（视为"无需自愈"），继续测试。
             RECOVERY_SELFHEAL_UNAVAILABLE=true
-            log "[恢复] WARNING：未找到 crontab，跳过 SysV 开机自愈安装（不影响本次测试与结束恢复）"
+            log "[恢复] 警告：未找到 crontab，跳过 SysV 开机自愈安装（不影响本次测试与结束恢复）"
             log "[恢复] 提示：如需崩溃自愈，请安装 cronie 后重跑：yum install -y cronie  # 或 dnf install -y cronie"
             return 0
         fi
@@ -3525,6 +3532,97 @@ compute_overall() {
     printf '%s' "$overall"
 }
 
+# ============================================================
+# 显示层中文化（仅影响"打印给人看"的文字，不改任何内部判定值）
+#
+# 设计原则（重要）：
+#   脚本内部大量逻辑依赖这些英文常量做相等比较，例如
+#       [[ "$cr" == "SERVER_UNSUPPORTED" ]]
+#       [[ "$nr" == "PASS" ]]
+#   若直接把常量本身改成中文，所有比较点都必须同步修改，一旦漏改就会
+#   产生"静默逻辑失效"（条件恒假、分支不再进入），且极难排查。
+#   因此这里采用"内部值保持英文、仅在输出时翻译为中文"的方案：
+#     - 内部判定、计数、正则匹配：全部沿用原英文常量，零风险；
+#     - 报告与终端输出：经过 show_* 系列函数转成中文（双语并列）。
+#   这样既满足"给人看的部分全中文"，又不触碰任何既有逻辑。
+# ============================================================
+
+# 把结果枚举值转为"英文（中文）"双语形式。
+# 未收录的值原样返回，保证新增状态不会显示为空。
+show_status() {
+    case "$1" in
+        PASS)                     printf 'PASS（通过）' ;;
+        FAIL)                     printf 'FAIL（失败）' ;;
+        WARN)                     printf 'WARN（告警）' ;;
+        UNKNOWN)                  printf 'UNKNOWN（未知）' ;;
+        SKIP)                     printf 'SKIP（跳过）' ;;
+        NOT_RUN)                  printf 'NOT_RUN（未执行）' ;;
+        NOT_TESTED)               printf 'NOT_TESTED（未测试）' ;;
+        AUTH_FAIL)                printf 'AUTH_FAIL（认证失败）' ;;
+        COMMAND_FAIL)             printf 'COMMAND_FAIL（命令执行失败）' ;;
+        CLIENT_FAIL)              printf 'CLIENT_FAIL（客户端失败）' ;;
+        NONE)                     printf 'NONE（无）' ;;
+        N/A)                      printf 'N/A（不适用）' ;;
+        UNSUPPORTED)              printf 'UNSUPPORTED（服务端不支持）' ;;
+        UNKNOWN/PRECHECK_ERROR)   printf 'UNKNOWN/PRECHECK_ERROR（未知/预检错误）' ;;
+        available)                printf 'available（可用）' ;;
+        missing)                  printf 'missing（缺失）' ;;
+        unavailable/not-used)     printf 'unavailable/not-used（不可用/未使用）' ;;
+        N/A\ \(not\ negotiated\)) printf 'N/A（未协商）' ;;
+        AEAD/N\ \(no\ traditional\ MAC\)) printf 'AEAD/N（无传统校验算法）' ;;
+        no)                       printf 'no（否）' ;;
+        yes)                      printf 'yes（是）' ;;
+        n/a)                      printf 'n/a（不适用）' ;;
+        *)                        printf '%s' "$1" ;;
+    esac
+}
+
+# 把客户端诊断码（CR）转为中文说明。
+# 取值清单严格对照代码中的实际赋值穷举得到，避免出现"翻译了不存在的值"
+# 或"新值未覆盖显示为空"。
+show_client_diag() {
+    case "$1" in
+        PASS)                   printf 'PASS（通过）' ;;
+        NEGOTIATED)             printf 'NEGOTIATED（协商完成）' ;;
+        NEGOTIATION_FAIL)       printf 'NEGOTIATION_FAIL（协商失败）' ;;
+        NEGOTIATION_MISMATCH)   printf 'NEGOTIATION_MISMATCH（协商值与请求不一致，疑降级）' ;;
+        SERVER_UNSUPPORTED)     printf 'SERVER_UNSUPPORTED（服务端不支持该算法）' ;;
+        CLIENT_REJECTED)        printf 'CLIENT_REJECTED（客户端自身不支持）' ;;
+        PRECHECK_ERROR)         printf 'PRECHECK_ERROR（预检错误）' ;;
+        CONFIG_INSTALL_FAILED)  printf 'CONFIG_INSTALL_FAILED（配置写入失败）' ;;
+        SERVER_DOWN)            printf 'SERVER_DOWN（服务端未运行）' ;;
+        SERVER_RESTART_FAILED)  printf 'SERVER_RESTART_FAILED（服务端重启失败）' ;;
+        UNKNOWN)                printf 'UNKNOWN（未知）' ;;
+        *)                      printf '%s' "$1" ;;
+    esac
+}
+
+# 把测试组名转为中文（保留英文便于与原约定对照）。
+# 组名值本身参与内部匹配（如 *"SERVER-FILTER/UNSUPPORTED"*），故只翻译显示。
+show_group() {
+    local g="$1"
+    case "$g" in
+        Cipher)          printf '加密算法（Cipher）' ;;
+        MAC)             printf '校验算法（MAC）' ;;
+        KEX)             printf '密钥交换（KEX）' ;;
+        HostKey)         printf '主机密钥（HostKey）' ;;
+        Compression)     printf '压缩算法（Compression）' ;;
+        Protocol)        printf '协议版本（Protocol）' ;;
+        "SSH-1 Cipher")  printf 'SSH-1 加密算法（SSH-1 Cipher）' ;;
+        *"UNSUPPORTED"*|*"PRECHECK_ERROR"*) printf '服务端预筛（%s）' "$g" ;;
+        *)               printf '%s' "$g" ;;
+    esac
+}
+
+# 把 OS_ID 之类的发行版标识转为中文说明（无法识别的原样返回）。
+show_os_id() {
+    case "$1" in
+        redhat-family) printf 'redhat-family（红帽系）' ;;
+        debian)        printf 'debian（Debian 系）' ;;
+        *)             printf '%s' "$1" ;;
+    esac
+}
+
 write_result() {
     local idx="$1" desc="$2" group="$3" proto="$4"
     local fk="$5" fc="$6" fm="$7" fh="$8"
@@ -3546,36 +3644,38 @@ write_result() {
     local overall
     overall="$(compute_overall "$nr" "$ar" "$er" "$cpr")"
 
+    # 显示层双语化：字段名与结果值均为"中文（英文）"或"英文（中文）"，
+    # 既方便中文读者，也保留英文便于与其它工具/文档对照。
     log ""
     log "-------------------- 测试结果 --------------------"
     log "测试项         : #${idx} ${desc}"
-    log "测试组         : ${group}"
+    log "测试组         : $(show_group "${group}")"
     log "协议           : SSH-${proto}"
-    log "固定 Protocol  : SSH-${proto}"
-    log "固定 KEX       : $([[ "$proto" == "1" ]] && echo N/A || echo "${fk:-UNKNOWN}")"
-    log "固定 Cipher    : ${fc:-UNKNOWN}"
-    log "固定 MAC       : $([[ "$proto" == "1" ]] && echo N/A || echo "${fm_report:-UNKNOWN}")"
-    log "固定 HostKey   : $([[ "$proto" == "1" ]] && echo RSA1 || echo "${fh:-UNKNOWN}")"
-    log "固定 Compression: ${result_compression}"
-    log "实际 KEX       : $([[ "$proto" == "1" ]] && echo N/A || echo "${nk:-UNKNOWN}")"
-    log "实际 Cipher    : ${nc:-UNKNOWN}"
-    log "实际 MAC       : $([[ "$proto" == "1" ]] && echo N/A || echo "${nm:-UNKNOWN}")"
-    log "实际 HostKey   : ${nh:-UNKNOWN}"
-    log "实际 Compression: ${actual_compression}"
-    log "协商结果 NR    : ${nr}"
-    log "认证结果 AR    : ${ar}"
-    log "命令执行结果 ER: ${er}"
-    log "客户端进程 CPR : ${cpr}"
-    log "客户端诊断 CR  : ${cr}"
-    log "默认配置支持   : ${default_supported}"
+    log "固定 协议      : SSH-${proto}"
+    log "固定 密钥交换  : $([[ "$proto" == "1" ]] && echo N/A || echo "$(show_status "${fk:-UNKNOWN}")")"
+    log "固定 加密算法  : ${fc:-UNKNOWN}"
+    log "固定 校验算法  : $([[ "$proto" == "1" ]] && echo N/A || echo "$(show_status "${fm_report:-UNKNOWN}")")"
+    log "固定 主机密钥  : $([[ "$proto" == "1" ]] && echo RSA1 || echo "${fh:-UNKNOWN}")"
+    log "固定 压缩      : ${result_compression}"
+    log "实际 密钥交换  : $([[ "$proto" == "1" ]] && echo N/A || echo "${nk:-UNKNOWN}")"
+    log "实际 加密算法  : ${nc:-UNKNOWN}"
+    log "实际 校验算法  : $([[ "$proto" == "1" ]] && echo N/A || echo "${nm:-UNKNOWN}")"
+    log "实际 主机密钥  : $(show_status "${nh:-UNKNOWN}")"
+    log "实际 压缩      : $(show_status "${actual_compression}")"
+    log "协商结果 NR    : $(show_status "$nr")"
+    log "认证结果 AR    : $(show_status "$ar")"
+    log "命令执行结果 ER: $(show_status "$er")"
+    log "客户端进程 CPR : $(show_status "$cpr")"
+    log "客户端诊断 CR  : $(show_client_diag "$cr")"
+    log "默认配置支持   : $(show_status "$default_supported")"
     if [[ "$group" == *"SERVER-FILTER/UNSUPPORTED"* ]] || [[ "$cr" == "SERVER_UNSUPPORTED" ]]; then
-        log "Server Filter   : UNSUPPORTED"
+        log "服务端预筛     : UNSUPPORTED（服务端不支持）"
     elif [[ "$group" == *"SERVER-FILTER/UNKNOWN/PRECHECK_ERROR"* ]]; then
-        log "Server Filter   : UNKNOWN/PRECHECK_ERROR"
+        log "服务端预筛     : UNKNOWN/PRECHECK_ERROR（未知/预检错误）"
     else
-        log "Server Filter   : NONE"
+        log "服务端预筛     : NONE（无过滤，已实际执行）"
     fi
-    log "总体结果       : ${overall}"
+    log "总体结果       : $(show_status "$overall")"
     [[ -n "$reason" ]] && log "原因           : ${reason}"
     log "---------------------------------------------------"
 }
@@ -3860,10 +3960,10 @@ load_supported_algorithms() {
         SUPPORTED_MAC="$("$SSHD_BIN" -Q mac 2>/dev/null || true)"
         SUPPORTED_HOSTKEY="$("$SSHD_BIN" -Q key 2>/dev/null || true)"
     fi
-    env_log "sshd -Q kex: $([[ -n "$SUPPORTED_KEX" ]] && echo available || echo unavailable/not-used)"
-    env_log "sshd -Q cipher: $([[ -n "$SUPPORTED_CIPHER" ]] && echo available || echo unavailable/not-used)"
-    env_log "sshd -Q mac: $([[ -n "$SUPPORTED_MAC" ]] && echo available || echo unavailable/not-used)"
-    env_log "sshd -Q key: $([[ -n "$SUPPORTED_HOSTKEY" ]] && echo available || echo unavailable/not-used)"
+    env_log "sshd -Q 密钥交换: $([[ -n "$SUPPORTED_KEX" ]] && echo 'available（可用）' || echo 'unavailable/not-used（不可用/未使用）')"
+    env_log "sshd -Q 加密算法: $([[ -n "$SUPPORTED_CIPHER" ]] && echo 'available（可用）' || echo 'unavailable/not-used（不可用/未使用）')"
+    env_log "sshd -Q 校验算法: $([[ -n "$SUPPORTED_MAC" ]] && echo 'available（可用）' || echo 'unavailable/not-used（不可用/未使用）')"
+    env_log "sshd -Q 主机密钥: $([[ -n "$SUPPORTED_HOSTKEY" ]] && echo 'available（可用）' || echo 'unavailable/not-used（不可用/未使用）')"
 }
 
 load_effective_algorithms() {
@@ -3887,7 +3987,7 @@ load_effective_algorithms() {
     EFFECTIVE_HOSTKEY_ALGORITHMS="$(printf '%s\n' "$output" | awk '$1 == "hostkeyalgorithms" { print $2 }' | tr \, '\n')"
     EFFECTIVE_COMPRESSION="$(printf '%s\n' "$output" | awk '$1 == "compression" { print $2 }')"
 
-    env_log "sshd -T -f $config: available"
+    env_log "sshd -T -f $config: available（可用）"
     return 0
 }
 
@@ -4067,7 +4167,7 @@ detect_match_algorithm_overrides() {
     ' "$BACKUP_FILE" 2>/dev/null || true)"
 
     if [[ -n "$found" ]]; then
-        env_log "WARNING：原始 sshd_config 的 Match 块包含算法/协议覆盖项；测试覆盖已置于 Match 之前，但以下规则已记录："
+        env_log "警告：原始 sshd_config 的 Match 块包含算法/协议覆盖项；测试覆盖已置于 Match 之前，但以下规则已记录："
         while IFS= read -r line; do
             [[ -n "$line" ]] && env_log "  MATCH_OVERRIDE: $line"
         done <<< "$found"
@@ -4235,7 +4335,7 @@ restore_after_test() {
             [[ -n "$restore_tmp" ]] && rm -f "$restore_tmp"
         fi
     elif [[ -f "$BACKUP_FILE" ]]; then
-        log "[恢复] WARNING：$reason：sshd_config 已被外部修改（不含测试 marker），跳过恢复以避免覆盖外部修改"
+        log "[恢复] 警告：$reason：sshd_config 已被外部修改（不含测试 marker），跳过恢复以避免覆盖外部修改"
     fi
 
     # 仅在配置确实被 mv 替换后才需要重启服务恢复；
@@ -4280,6 +4380,38 @@ record_result() {
         SKIP) SKIP=$((SKIP + 1)) ;;
         *) UNKNOWN=$((UNKNOWN + 1)) ;;
     esac
+
+    # ------------------------------------------------------------
+    # 结论摘要用的两个辅助计数（仅供末尾"结论摘要"区使用，不影响既有逻辑）：
+    #   NOT_RUN_TOTAL    —— 命令执行结果 ER=NOT_RUN 的项：预检阶段即判负、
+    #                       从未真正执行过，统计通过率时应从分母剔除。
+    #   UNSUPPORTED_FAIL —— 其中因"服务端不支持"而判 FAIL 的项：属预期负结果，
+    #                       不应混入"真失败"计数。
+    # 判定依据取 CR(SERVER_UNSUPPORTED/SERVER_FILTER) 与 ER(NOT_RUN)，
+    # 与 write_result 输出的字段语义保持一致。
+    # ------------------------------------------------------------
+    if [[ "$er" == "NOT_RUN" ]]; then
+        NOT_RUN_TOTAL=$((NOT_RUN_TOTAL + 1))
+        case "$cr" in
+            SERVER_UNSUPPORTED|CLIENT_REJECTED) UNSUPPORTED_FAIL=$((UNSUPPORTED_FAIL + 1)) ;;
+        esac
+    fi
+
+    # ------------------------------------------------------------
+    # 收集「非 PASS」项，供末尾摘要区打印一览表。
+    # 目的：报告正文有上千行，人工想知道"到底哪几项没通过"必须逐项翻或靠
+    # grep。这里顺手缓存成一行，末尾直接列出，省掉翻阅成本。
+    # 只缓存非 PASS（WARN/FAIL/UNKNOWN），PASS 是绝大多数、无需列出。
+    # ------------------------------------------------------------
+    if [[ "$overall" != "PASS" ]]; then
+        local fail_reason="${reason:-}"
+        [[ -n "$fail_reason" ]] || fail_reason="（无）"
+        # 结果列用英文枚举（不含空格，供下方的分组判断按列取值）。
+        # 中文含义由紧随其后的"测试组/原因"列与表下说明共同表达，
+        # 避免在窄列里塞入长中文导致表格错位。
+        NOTPASS_LINES+=("$(printf '%-4s %-13s %-26s %s' \
+            "#${idx}" "$overall" "$(show_group "${group:-UNKNOWN}")" "$fail_reason")")
+    fi
 
     write_result "$idx" "$desc" "$group" "$proto" \
         "$fk" "$fc" "$fm" "$fh" "$nk" "$nc" "$nm" "$nh" \
@@ -4354,8 +4486,8 @@ test_one() {
         NR="FAIL"
         AR="NOT_TESTED"
         CR="SERVER_UNSUPPORTED"
-        reason="${precheck_reason:-Server Filter 判定为 UNSUPPORTED}"
-        log "Server Filter：UNSUPPORTED"
+        reason="${precheck_reason:-服务端预筛判定为 UNSUPPORTED（服务端不支持）}"
+        log "服务端预筛：UNSUPPORTED（服务端不支持）"
         log "原因：$reason"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "" "" "" "" "$NR" "$AR" "$CR" "$reason"
@@ -4366,8 +4498,8 @@ test_one() {
         NR="UNKNOWN"
         AR="NOT_TESTED"
         CR="PRECHECK_ERROR"
-        reason="${precheck_reason:-Server Filter 判定为 UNKNOWN/PRECHECK_ERROR}"
-        log "Server Filter：UNKNOWN/PRECHECK_ERROR"
+        reason="${precheck_reason:-服务端预筛判定为 UNKNOWN/PRECHECK_ERROR（未知/预检错误）}"
+        log "服务端预筛：UNKNOWN/PRECHECK_ERROR（未知/预检错误）"
         log "原因：$reason"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "" "" "" "" "$NR" "$AR" "$CR" "$reason"
@@ -4429,8 +4561,8 @@ test_one() {
         AR="NOT_TESTED"
         CR="NEGOTIATION_FAIL"
 
-        log "实际协商：UNKNOWN"
-        log "总体结果：NEGOTIATION_FAIL"
+        log "实际协商：UNKNOWN（未知）"
+        log "总体结果：NEGOTIATION_FAIL（协商失败）"
         log "原因：sshd -t 配置校验失败：$reason"
 
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
@@ -4448,8 +4580,8 @@ test_one() {
         AR="NOT_TESTED"
         CR="NEGOTIATION_FAIL"
         reason="sshd -T -f 临时配置失败"
-        log "实际协商：UNKNOWN"
-        log "总体结果：NEGOTIATION_FAIL"
+        log "实际协商：UNKNOWN（未知）"
+        log "总体结果：NEGOTIATION_FAIL（协商失败）"
         log "原因：$reason"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -4474,8 +4606,8 @@ test_one() {
             AR="NOT_TESTED"
             CR="NEGOTIATION_FAIL"
             reason="sshd -T 最终配置未启用:$effective_unsupported"
-            log "实际协商：UNKNOWN"
-            log "总体结果：NEGOTIATION_FAIL"
+            log "实际协商：UNKNOWN（未知）"
+            log "总体结果：NEGOTIATION_FAIL（协商失败）"
             log "原因：$reason"
             record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
                 "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -4490,7 +4622,7 @@ test_one() {
         AR="NOT_TESTED"
         CR="CONFIG_INSTALL_FAILED"
         reason="测试配置安装失败（mv 失败），已停止本 TEST_CASE"
-        log "总体结果：UNKNOWN"
+        log "总体结果：UNKNOWN（未知）"
         log "原因：$reason"
         rm -f "$tmp"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
@@ -4505,8 +4637,8 @@ test_one() {
         CR="SERVER_RESTART_FAILED"
         reason="sshd 重启失败"
 
-        log "实际协商：UNKNOWN"
-        log "总体结果：UNKNOWN"
+        log "实际协商：UNKNOWN（未知）"
+        log "总体结果：UNKNOWN（未知）"
         log "原因：$reason"
 
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
@@ -4522,8 +4654,8 @@ test_one() {
         CR="SERVER_DOWN"
         reason="sshd 重启后 60 秒内未进入运行状态"
 
-        log "实际协商：UNKNOWN"
-        log "总体结果：UNKNOWN"
+        log "实际协商：UNKNOWN（未知）"
+        log "总体结果：UNKNOWN（未知）"
         log "原因：$reason"
 
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
@@ -4543,8 +4675,8 @@ test_one() {
         AR="NOT_TESTED"
         CR="NEGOTIATION_FAIL"
         reason="sshd 重启后无法读取最终生效配置，测试组合无法可靠进入协商：sshd -T -f $SSHD_CONFIG"
-        log "实际协商：UNKNOWN"
-        log "总体结果：NEGOTIATION_FAIL"
+        log "实际协商：UNKNOWN（未知）"
+        log "总体结果：NEGOTIATION_FAIL（协商失败）"
         log "原因：$reason"
         record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
             "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -4567,8 +4699,8 @@ test_one() {
             AR="NOT_TESTED"
             CR="NEGOTIATION_FAIL"
             reason="重启后 sshd -T 有效配置与测试项不一致，组合未真正生效:$running_unsupported"
-            log "实际协商：UNKNOWN"
-            log "总体结果：NEGOTIATION_FAIL"
+            log "实际协商：UNKNOWN（未知）"
+            log "总体结果：NEGOTIATION_FAIL（协商失败）"
             log "原因：$reason"
             record_result "$idx" "$desc" "$group" "$proto" "$kex" "$cipher" "$mac" "$hostkey" \
                 "$NK" "$NC" "$NM" "$NH" "$NR" "$AR" "$CR" "$reason"
@@ -5083,8 +5215,8 @@ test_one() {
     local overall_txt
     overall_txt="$(compute_overall "$NR" "$AR" \
         "${RESULT_COMMAND:-UNKNOWN}" "${RESULT_CLIENT_PROCESS:-UNKNOWN}")"
-    log "总体结果：${overall_txt}"
-    log "客户端结果：${CR}"
+    log "总体结果：$(show_status "${overall_txt}")"
+    log "客户端结果：$(show_client_diag "${CR}")"
     [[ -n "$reason" ]] && log "原因：${reason}"
 
     # Compression Coverage 只接受实际协商证据；固定测试值不能替代缺失的
@@ -5133,11 +5265,11 @@ done
 
 
 env_log "结束时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-env_log "PASS: $PASS"
-env_log "FAIL: $FAIL"
-env_log "WARN: $WARN"
-env_log "UNKNOWN: $UNKNOWN"
-env_log "SKIP: $SKIP"
+env_log "通过 PASS: $PASS"
+env_log "失败 FAIL: $FAIL"
+env_log "告警 WARN: $WARN"
+env_log "未知 UNKNOWN: $UNKNOWN"
+env_log "跳过 SKIP: $SKIP"
 env_log "配置恢复要求: 已注册 EXIT/INT/TERM cleanup"
 [[ "$RECOVERY_SELFHEAL_UNAVAILABLE" == "true" ]] && \
     env_log "注意: 崩溃自愈不可用（缺 crontab 或安装失败），本次为无自愈模式运行"
@@ -5145,15 +5277,117 @@ env_log "配置恢复要求: 已注册 EXIT/INT/TERM cleanup"
 log ""
 log "============================================================"
 log "测试完成"
-log "PASS: $PASS"
-log "FAIL: $FAIL"
-log "WARN: $WARN"
-log "UNKNOWN: $UNKNOWN"
-log "SKIP: $SKIP"
+log "通过 PASS: $PASS"
+log "失败 FAIL: $FAIL"
+log "告警 WARN: $WARN"
+log "未知 UNKNOWN: $UNKNOWN"
+log "跳过 SKIP: $SKIP"
 log "总测试项: $TEST_INDEX"
-log "计划 Coverage（仅用于生成器决策）: KEX=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^kex|//p' | paste -sd, -) Cipher=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) MAC=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^mac|//p' | paste -sd, -) HostKey=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^hostkey|//p' | paste -sd, -) Compression=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
-log "SSH-2 实际 Coverage（仅成功协商结果）: KEX=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^kex|//p' | paste -sd, -) Cipher=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) MAC=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^mac|//p' | paste -sd, -) HostKey=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^hostkey|//p' | paste -sd, -) Compression=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
-log "SSH-1 实际 Coverage（仅成功协商结果）: Cipher=$(printf '%s\n' "${!ACTUAL_SSH1_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) Compression=$(printf '%s\n' "${!ACTUAL_SSH1_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
+log "计划覆盖（仅用于生成器决策）: 密钥交换=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^kex|//p' | paste -sd, -) 加密算法=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) 校验算法=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^mac|//p' | paste -sd, -) 主机密钥=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^hostkey|//p' | paste -sd, -) 压缩=$(printf '%s\n' "${!PLAN_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
+log "SSH-2 实际覆盖（仅成功协商结果）: 密钥交换=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^kex|//p' | paste -sd, -) 加密算法=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) 校验算法=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^mac|//p' | paste -sd, -) 主机密钥=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^hostkey|//p' | paste -sd, -) 压缩=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
+log "SSH-1 实际覆盖（仅成功协商结果）: 加密算法=$(printf '%s\n' "${!ACTUAL_SSH1_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) 压缩=$(printf '%s\n' "${!ACTUAL_SSH1_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
+
+# ------------------------------------------------------------
+# 人类可读摘要（结论区）
+#
+# 详细日志有上千行，且混杂大量过程性输出（[环境]/[恢复] 等）。人工翻阅时
+# 真正关心的其实只有三件事：
+#   1) 有没有"本该通过却失败"的真问题（NOT_RUN 不算，那是从未执行）；
+#   2) 有没有被静默降级的 WARN；
+#   3) 真实的通过率是多少（分母要剔除从未执行的项）。
+# 此处把这三件事单独打印在末尾，让报告可以不看中间直接读结论。
+# 详细数据仍在上面完整保留，不影响机器解析。
+# ------------------------------------------------------------
+{
+    SUMMARY_REAL_FAIL=$(( FAIL - UNSUPPORTED_FAIL ))
+    (( SUMMARY_REAL_FAIL < 0 )) && SUMMARY_REAL_FAIL=0
+    SUMMARY_EXECUTED=$(( TEST_INDEX - NOT_RUN_TOTAL ))
+    (( SUMMARY_EXECUTED < 0 )) && SUMMARY_EXECUTED=0
+
+    printf '\n'
+    printf '============================================================\n'
+    printf ' 结论摘要（先看这里）\n'
+    printf '============================================================\n'
+    printf ' 环境      : %s\n' "${OS_PRETTY:-未知}"
+    printf ' 画像      : %s\n' "${PROFILE:-未知}"
+    printf ' 总测试项  : %d\n' "$TEST_INDEX"
+    printf '\n'
+    printf ' 【实际执行】 %d 项     【从未执行】 %d 项（服务端不支持，预检阶段即判定，非失败）\n' \
+        "$SUMMARY_EXECUTED" "$NOT_RUN_TOTAL"
+    printf '\n'
+    printf ' 【真正通过】 %d 项 / 实际执行 %d 项' "$PASS" "$SUMMARY_EXECUTED"
+    if (( SUMMARY_EXECUTED > 0 )); then
+        printf ' （通过率 %d%%）' "$(( PASS * 100 / SUMMARY_EXECUTED ))"
+    fi
+    printf '\n'
+    printf '\n'
+
+    if (( SUMMARY_REAL_FAIL > 0 )); then
+        printf ' [!] 需要关注：有 %d 项「已执行但未通过」（这才是真问题）\n' "$SUMMARY_REAL_FAIL"
+    else
+        printf ' [OK] 无「已执行但未通过」的项 —— 服务端不支持的部分已全部排除在外\n'
+    fi
+
+    if (( WARN > 0 )); then
+        printf ' [!] 需要关注：有 %d 项降级/偏差告警（WARN），算法"能连"但实际落地值与请求不同（见明细）\n' "$WARN"
+    fi
+
+    # ------------------------------------------------------------
+    # 非 PASS 项一览表：把需要关注/需要知晓的项直接列出来，
+    # 免去在正文中逐项翻阅。按结果分组打印，先看"要管的"再看"不用管的"。
+    # ------------------------------------------------------------
+    if (( ${#NOTPASS_LINES[@]} > 0 )); then
+        printf '\n'
+        printf ' --------------------------------------------------------\n'
+        printf ' 非通过（非 PASS）项一览（共 %d 项）\n' "${#NOTPASS_LINES[@]}"
+        printf ' --------------------------------------------------------\n'
+        printf ' %-4s %-13s %-26s %s\n' "编号" "结果" "测试组" "原因"
+        printf ' --------------------------------------------------------\n'
+        printf ' 【结果列说明】WARN=告警（需人工确认） FAIL=失败 UNKNOWN=未知 SKIP=跳过\n'
+        printf ' --------------------------------------------------------\n'
+        # 先打需要人工介入的（WARN / 真 FAIL），再打可忽略的（UNSUPPORTED/未知）
+        for _line in "${NOTPASS_LINES[@]}"; do
+            _res="$(printf '%s' "$_line" | awk '{print $2}')"
+            case "$_res" in
+                WARN) printf ' %s\n' "$_line" ;;
+            esac
+        done
+        for _line in "${NOTPASS_LINES[@]}"; do
+            _res="$(printf '%s' "$_line" | awk '{print $2}')"
+            case "$_res" in
+                FAIL)
+                    case "$_line" in
+                        *UNSUPPORTED*|*not\ supported*|*不支持*|*Unknown\ cipher*) : ;;
+                        *) printf ' %s\n' "$_line" ;;
+                    esac
+                    ;;
+            esac
+        done
+        printf ' --- 以下为"服务端不支持/从未执行"，属预期负结果，通常无需处理 ---\n'
+        for _line in "${NOTPASS_LINES[@]}"; do
+            _res="$(printf '%s' "$_line" | awk '{print $2}')"
+            case "$_res" in
+                FAIL)
+                    case "$_line" in
+                        *UNSUPPORTED*|*not\ supported*|*不支持*|*Unknown\ cipher*) printf ' %s\n' "$_line" ;;
+                    esac
+                    ;;
+                UNKNOWN|SKIP) printf ' %s\n' "$_line" ;;
+            esac
+        done
+        printf ' --------------------------------------------------------\n'
+        printf ' 提示：结果列为 WARN（告警）的需人工确认；结果列为 FAIL（失败）的\n'
+        printf '       需结合正文的 "服务端预筛" 字段区分性质（UNSUPPORTED 属预期负结果）。\n'
+    fi
+
+    printf '\n'
+    printf ' 明细定位（在本文档中搜索下列字段名，注意字段值两侧有对齐空格）：\n'
+    printf '   真失败项   : 字段 "服务端预筛" 值为 NONE，且 "总体结果" 为 FAIL\n'
+    printf '   降级告警项 : 字段 "总体结果" 值为 WARN\n'
+    printf '   从未执行项 : 字段 "命令执行结果 ER" 值为 NOT_RUN\n'
+    printf ' （提示：本摘要区只是说明文字，统计以上面正文的字段值为准。）\n'
+    printf '============================================================\n'
+} | tee -a "$LOG_FILE"
 
 
 log "结果与详细日志：$LOG_FILE"
