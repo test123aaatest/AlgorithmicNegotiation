@@ -12,10 +12,11 @@
 #   - 每次只修改一个测试配置，测试完成后恢复
 #   - 协商结果与认证结果分离
 #   - 算法结果不与 SSH 客户端退出码直接绑定
-#   - 保留详细测试日志、环境/执行信息、结构化结果；统一写入 TXT
+#   - 保留详细测试日志、环境/执行信息、结构化结果；统一写入 HTML
 #
 # 输出（当前目录）：
-#   仅 1 个 TXT；测试过程中实时同时输出到终端
+#   仅 1 个 HTML（自带样式与交互，无外部依赖，可直接双击打开/邮件转发）；
+#   测试过程中实时同时输出到终端。内部仍按文本行流收集，结束前统一渲染，
 #
 # 功能：自动探测当前运行环境（OpenSSH 版本 + init 系统），据此
 # 选择并运行对应的算法兼容性测试集，全程共用同一套备份/崩溃自愈/
@@ -92,17 +93,40 @@ LOOPBACK_TARGET="root@127.0.0.1"
 # 默认端口 22；可用 --port= 覆盖
 PORT=22
 
-# 日志先落在当前工作目录；若该目录不可写/已被删除（如 cd 到已删除目录），
-# mktemp 会失败，此时回退到 /tmp，仅当两处都失败才退出，避免脚本完全无法运行。
-LOG_FILE="$(mktemp "${BASE_DIR}/ssh_algorithm_test_${TS}_XXXXXX.txt" 2>/dev/null)" || \
-    LOG_FILE="$(mktemp "/tmp/ssh_algorithm_test_${TS}_XXXXXX.txt" 2>/dev/null)" || {
-    echo "错误：无法创建安全日志文件（已尝试 ${BASE_DIR} 与 /tmp）" >&2
+# 报告为单个 HTML，最终落在当前工作目录；若该目录不可写/已被删除（如 cd 到
+# 已删除目录），mktemp 会失败，此时回退到 /tmp，仅当两处都失败才退出。
+# 注意：这只是"最终落盘路径"，测试过程中所有内容先收集到 LOG_BUFFER（内存
+# 缓冲），结束时由 render_html_report 一次性渲染写入，全程不产生 TXT。
+# 生成报告文件路径：<目录>/<时间戳>.html；若同名已存在（如同一秒内跑两次），
+# 追加 -1、-2 … 直到不冲突，避免覆盖已有报告。
+# 不再使用 mktemp：报告名只保留时间戳（用户 2026-09-12 明确要求）。
+# 安全性说明：路径完全由时间戳与本函数控制，不含用户输入，创建时用 noclobber
+# 防止跟随符号链接写入（与 mktemp 的原子创建等价，代价是丢掉 6 位随机串）。
+make_report_path() {
+    local dir="$1" base="${2:-$TS}" candidate n=0
+    candidate="${dir}/${base}.html"
+    while [[ -e "$candidate" ]]; do
+        n=$((n + 1))
+        candidate="${dir}/${base}-${n}.html"
+    done
+    printf '%s\n' "$candidate"
+}
+
+REPORT_FILE="$(make_report_path "$BASE_DIR")"
+# 回退：若 BASE_DIR 不可写（如 cd 到已删除目录），改用 /tmp。
+if ! ( set -o noclobber; : >"$REPORT_FILE" ) 2>/dev/null; then
+    REPORT_FILE="$(make_report_path /tmp)"
+    if ! ( set -o noclobber; : >"$REPORT_FILE" ) 2>/dev/null; then
+        echo "错误：无法创建报告文件（已尝试 ${BASE_DIR} 与 /tmp）" >&2
+        exit 1
+    fi
+fi
+chmod 600 "$REPORT_FILE" || {
+    echo "错误：无法设置报告文件权限：$REPORT_FILE" >&2
     exit 1
 }
-chmod 600 "$LOG_FILE" || {
-    echo "错误：无法设置日志文件权限：$LOG_FILE" >&2
-    exit 1
-}
+# 文本行缓冲（内存）：数百处 log 调用照旧追加到这里，不落任何 TXT。
+LOG_BUFFER=""
 
 RESTORED=false
 # 恢复失败标记：任意恢复步骤失败即中止脚本并带非零退出码退出，
@@ -498,21 +522,21 @@ need_cmd() {
 }
 
 log() {
-    if [[ -f "$LOG_FILE" ]]; then
-        printf '%s\n' "$*" | tee -a "$LOG_FILE"
-    else
-        printf '%s\n' "$*"
-    fi
+    # 终端实时显示 + 追加到内存缓冲（结束前统一渲染成 HTML，不落 TXT）。
+    printf '%s\n' "$*"
+    LOG_BUFFER+="$*
+"
 }
 
 initialize_log_file() {
-    # 把日志从当前目录（可能是普通用户可读写的 /tmp 等）迁到受保护的
-    # 状态目录下（0700 目录 + 0600 文件）。STATE_DIR 形如
+    # 报告最终落在受保护的状态目录下（0700 目录 + 0600 文件）。STATE_DIR 形如
     # /var/lib/ssh-algo-unified/<TS>_<PID>，取其父目录 STATE_ROOT。
+    # 由于内容此时仍在内存缓冲（LOG_BUFFER），此处只做"迁移目标路径 + 目录权限"
+    # 的准备工作：若受保护目录可写，就把 REPORT_FILE 指过去；否则保留当前
+    # BASE_DIR 下的路径，避免只读运行目录导致脚本无法继续。
     local log_dir="${STATE_DIR%/*}"
-    local prev_log="$LOG_FILE"
+    local prev_report="$REPORT_FILE"
 
-    # 注意 SC2174：mkdir -p 的 -m 只作用于最深层目录，父目录（如
     # /var/lib/ssh-algo-unified 乃至 /var/lib）不受其约束。这里分层创建
     # 并对每一层显式 chmod，避免中间目录以默认 umask 权限裸露。
     local p _created=""
@@ -528,27 +552,26 @@ initialize_log_file() {
     [[ -n "$_created" ]] && chmod 700 "$_created" 2>/dev/null || true
 
     if [[ -d "$log_dir" && -w "$log_dir" ]]; then
-        if LOG_FILE="$(mktemp "${log_dir}/ssh_algorithm_test_${TS}_XXXXXX.txt" 2>/dev/null)"; then
-            if chmod 600 "$LOG_FILE" 2>/dev/null; then
-                [[ -n "$prev_log" && -f "$prev_log" ]] && rm -f "$prev_log" 2>/dev/null || true
+        local new_report
+        new_report="$(make_report_path "$log_dir")"
+        if ( set -o noclobber; : >"$new_report" ) 2>/dev/null; then
+            if chmod 600 "$new_report" 2>/dev/null; then
+                [[ -n "$prev_report" && -f "$prev_report" ]] && rm -f "$prev_report" 2>/dev/null || true
+                REPORT_FILE="$new_report"
                 return 0
             fi
+            rm -f "$new_report" 2>/dev/null || true
         fi
     fi
 
-    # 无法落盘到受保护目录时回退到原先的 BASE_DIR 日志，而不是直接退出，
-    # 避免只读运行目录导致脚本完全无法运行。
-    LOG_FILE="$prev_log"
-    if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
-        printf '%s\n' "[警告] 无法在受保护目录 $log_dir 创建日志，继续使用当前目录日志：$LOG_FILE"
-        return 0
-    fi
-    echo "错误：无法创建安全日志文件" >&2
-    exit 1
+    # 无法落到受保护目录时保留当前路径（BASE_DIR），而不是直接退出。
+    REPORT_FILE="$prev_report"
+    printf '%s\n' "[警告] 无法在受保护目录 $log_dir 创建报告，将继续使用当前目录：$REPORT_FILE" >&2
+    return 0
 }
 
 env_log() {
-    # 环境/执行信息与测试结果统一进入同一个 TXT，并实时显示到终端。
+    # 环境/执行信息与测试结果统一进入同一份报告（内存缓冲），并实时显示到终端。
     log "[环境] $*"
 }
 
@@ -700,6 +723,13 @@ detect_env() {
 load_worker_algorithms() {
     [[ -n "$WORKER_CIPHERS" ]] && return 0
     # 这是 Worker 已实现的完整算法基线
+    #
+    # ⛔⛔ 只读基准 —— 任何时候都不要修改本函数（2026-09-12 用户明确指令）⛔⛔
+    # 本函数是「客户端（Worker JS SSH）白名单」的忠实快照，不是脚本自己的算法表。
+    # 它的全部价值在于「如实反映客户端声明了什么」。
+    #   × 不要清理这里的无效拼写（sm2kex / sm2_sm3 / ecdh-sha2-nistb409 / nistb233 / nistk163）
+    #   × 不要删除老算法（blowfish-cbc / arcfour* / cast128-cbc 等）
+    # 详见交接文档 §9.5.2。
     WORKER_SSH1_CIPHERS=$'3des\nblowfish\nidea\narcfour\ndes'
     WORKER_CIPHERS=$'chacha20-poly1305@openssh.com\naes256-gcm@openssh.com\naes128-gcm@openssh.com\naes256-ctr\naes192-ctr\nsm4-ctr\naes128-ctr\naes256-cbc\naes192-cbc\naes128-cbc\nrijndael-cbc@lysator.liu.se\ntwofish256-cbc\ntwofish128-cbc\n3des-ctr\n3des-cbc\ncast128-cbc\nblowfish-cbc\narcfour256\narcfour128\narcfour\ndes-cbc'
     WORKER_KEX=$'mlkem768x25519-sha256\nsntrup761x25519-sha512@openssh.com\nsntrup761x25519-sha512\ncurve25519-sha256\ncurve25519-sha256@libssh.org\ncurve448-sha512\necdh-sha2-nistp521\necdh-sha2-nistp384\necdh-sha2-nistp256\nsm2-sm3\nsm2_sm3\nsm2kex\ndiffie-hellman-group18-sha512\ndiffie-hellman-group17-sha512\ndiffie-hellman-group16-sha512\ndiffie-hellman-group15-sha512\ndiffie-hellman-group-exchange-sha512\ndiffie-hellman-group14-sha256\ndiffie-hellman-group-exchange-sha256\ndiffie-hellman-group14-sha1\ndiffie-hellman-group-exchange-sha1\ndiffie-hellman-group5-sha1\ndiffie-hellman-group2-sha1\ndiffie-hellman-group1-sha1\necdh-sha2-nistb409\necdh-sha2-nistb233\necdh-sha2-nistk163'
@@ -839,6 +869,34 @@ hostkey_private_file() {
     esac
     [[ -n "$base" ]] || return 0
 
+    # ★ 曲线专属文件名优先：/etc/ssh/ssh_host_ecdsa_<bits>_key
+    #
+    # 历史背景：早期实现只认单一 /etc/ssh/ssh_host_ecdsa_key，并用
+    # ecdsa_key_curve_bits() 读它的实际位长做精确匹配，以保证不会把
+    # nistp384/nistp521 "假阳性"判成受支持。该设计有一个无法回避的缺陷：
+    # 一个私钥文件只能承载一条曲线，于是三条曲线里的另外两条**永远无法同时
+    # 被测**（测试环境即使备齐三条曲线的密钥，也只能命中当前文件的那一条）。
+    #
+    # 现在改为：若存在与目标曲线一一对应的专属文件
+    #   ecdsa-sha2-nistp256 -> /etc/ssh/ssh_host_ecdsa_256_key
+    #   ecdsa-sha2-nistp384 -> /etc/ssh/ssh_host_ecdsa_384_key
+    #   ecdsa-sha2-nistp521 -> /etc/ssh/ssh_host_ecdsa_521_key
+    # 就直接使用它，三条曲线得以并存并同时通过预筛与实测。
+    # 兼容性：若专属文件不存在，则回退到旧的单文件 + 曲线位长精确匹配逻辑，
+    # 行为与历史版本完全一致，不影响既有发行版结果。
+    #
+    # 注意「按位长校验」仍然保留：专属文件也可能被人误放成别的曲线，
+    # 校验不过就视为不支持（宁缺毋滥，避免生成必然 no matching 的用例）。
+    local curve_file="/etc/ssh/ssh_host_ecdsa_${want_bits}_key"
+    if [[ -f "$curve_file" ]]; then
+        local curve_bits
+        curve_bits="$(ecdsa_key_curve_bits "$curve_file" 2>/dev/null || true)"
+        if [[ "$curve_bits" == "$want_bits" ]]; then
+            printf '%s\n' "$curve_file"
+            return 0
+        fi
+    fi
+
     keyfile="/etc/ssh/ssh_host_ecdsa_key"
     [[ -f "$keyfile" ]] || return 1
     # 关键校验：单个 ssh_host_ecdsa_key 只对应一条 ECDSA 曲线。原先 `ecdsa-sha2-*`
@@ -935,7 +993,7 @@ append_probe_base_config() {
         /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]+[Aa][Ll][Ll]([[:space:]]|$)/ { in_match=0; print; next }
         /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh]([[:space:]]|$)/ { in_match=1 }
         {
-            if ($0 ~ /^[[:space:]]*(Protocol|KexAlgorithms|Ciphers|Cipher|MACs|HostKeyAlgorithms|HostKey|Include)[[:space:]]+/ ||
+            if ($0 ~ /^[[:space:]]*(Protocol|KexAlgorithms|Ciphers|Cipher|MACs|HostKeyAlgorithms|HostKey|HostCertificate|Include)[[:space:]]+/ ||
                 (!in_match && $0 ~ /^[[:space:]]*(Port|ListenAddress|LogLevel|Compression)[[:space:]]+/)) {
                 print "# UNIFIED_PROBE_COMMENTED: " $0
             } else {
@@ -977,6 +1035,14 @@ server_candidate_supported() {
             printf '%s\n' "HostKeyAlgorithms $hostkey"
         fi
         printf '%s\n' "HostKey $hostkey_file"
+        # 证书主机密钥必须在探测配置里同样加载 HostCertificate，否则 sshd -T
+        # 不会把 <alg>-cert 写进 hostkeyalgorithms，第 1018 行的匹配必然失败，
+        # 该证书项会被误判为"服务端不支持"而在预筛阶段直接过滤掉。
+        if [[ "$hostkey" == *-cert-v01@openssh.com ]]; then
+            local _hc
+            _hc="$(hostkey_certificate_required "$hostkey" 2>/dev/null || true)"
+            [[ -n "$_hc" && -f "$_hc" ]] && printf '%s\n' "HostCertificate $_hc"
+        fi
         case "$compression" in
             zlib@openssh.com) printf '%s\n' 'Compression delayed' ;;
             zlib) printf '%s\n' 'Compression yes' ;;
@@ -1059,9 +1125,6 @@ mark_normal_coverage() {
 }
 
 mark_actual_coverage() {
-    # 直接操作两个目标关联数组，不用 nameref 间接绑定：
-    # 静态检查工具无法追踪 `local -n x=ARR` 后 x[...]=1 是在写关联数组，会误报
-    # SC2178/SC2034；显式分支写具体数组名既消除误报，也让"写入哪个数组"一目了然。
     local proto="$1" kex="$2" cipher="$3" mac="$4" hostkey="$5" compression="${6:-}" nr="${7:-UNKNOWN}"
     [[ "$nr" == "PASS" ]] || return 0
     if [[ "$proto" == "2" ]]; then
@@ -2164,11 +2227,11 @@ if $LIST_ONLY; then
     i=0
     for d in "${DESCS[@]}"; do
         i=$((i + 1))
-        printf '%3d. %-45s [protocol=SSH-%s kex=%s cipher=%s mac=%s hostkey=%s compression=%s default=%s]\n' \
+        log "$(printf '%3d. %-45s [protocol=SSH-%s kex=%s cipher=%s mac=%s hostkey=%s compression=%s default=%s]' \
             "$i" "$d" "${PROTOCOLS[$((i - 1))]}" \
             "${KEXES[$((i - 1))]:-N/A}" "${CIPHERS[$((i - 1))]:-N/A}" \
             "${MACS[$((i - 1))]:-N/A}" "${HOSTKEYS[$((i - 1))]:-N/A}" \
-            "${COMPRESSIONS[$((i - 1))]:-N/A}" "${DEFAULT_FLAGS[$((i - 1))]:-n/a}" | tee -a "$LOG_FILE"
+            "${COMPRESSIONS[$((i - 1))]:-N/A}" "${DEFAULT_FLAGS[$((i - 1))]:-n/a}")"
     done
     log "========================================"
     exit 0
@@ -2401,6 +2464,17 @@ wait_service_ready() {
     service_is_up
 }
 
+# 把 OS_ID 之类的发行版标识转为中文说明（无法识别的原样返回）。
+# 注意：本函数必须在下方首个 env_log 调用（系统标识 OS_ID）之前定义，
+# 否则运行时会报 "show_os_id: command not found"（仅该行显示为空，不影响测试）。
+show_os_id() {
+    case "$1" in
+        redhat-family) printf 'redhat-family（红帽系）' ;;
+        debian)        printf 'debian（Debian 系）' ;;
+        *)             printf '%s' "$1" ;;
+    esac
+}
+
 env_log "SSH 算法协商测试 - 环境/执行信息"
 env_log "开始时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 env_log "当前目录: $BASE_DIR"
@@ -2481,7 +2555,6 @@ record_initial_state() {
 
 backup_config() {
     [[ -f "$SSHD_CONFIG" ]] || die "配置文件不存在：$SSHD_CONFIG"
-    # SC2174：mkdir -p -m 只作用于最深层目录。STATE_ROOT(/var/lib/ssh-algo-unified)
     # 若不存在会以默认 umask 创建，这里显式创建并收紧权限为 700。
     if [[ ! -d "${STATE_ROOT}" ]]; then
         mkdir -p "${STATE_ROOT}" 2>/dev/null || true
@@ -2631,7 +2704,7 @@ restore_all() {
         return 0
     fi
 
-    printf '\n' | tee -a "$LOG_FILE"
+    log ""
     log "[恢复] 开始恢复配置、服务状态和临时文件..."
 
     # 若脚本在 ssh 客户端运行期间被 INT/TERM/EXIT trap 打断，此处终止并回收
@@ -3615,12 +3688,307 @@ show_group() {
 }
 
 # 把 OS_ID 之类的发行版标识转为中文说明（无法识别的原样返回）。
-show_os_id() {
-    case "$1" in
-        redhat-family) printf 'redhat-family（红帽系）' ;;
-        debian)        printf 'debian（Debian 系）' ;;
-        *)             printf '%s' "$1" ;;
-    esac
+# ============================================================
+# 最终报告渲染：把内存文本缓冲（LOG_BUFFER）渲染为单个 HTML 文件。
+# 零外部依赖（仅 bash + awk + sed），不产生任何 TXT 中间文件。
+# 渲染策略与结构对照 ssh_algorithm_report_to_html.py（同源逻辑）：
+#   1) awk 解析出 报告头 / 环境信息 / 测试项 / 非通过一览；
+#   2) 分类统计（通过 / 真失败 / 服务端不支持 / 告警）；
+#   3) 生成自包含 HTML（内嵌 CSS/JS，可搜索、可筛选、可折叠）。
+# ============================================================
+render_html_report() {
+    local tmp_in tmp_out
+    tmp_in="$(mktemp "${STATE_DIR}/_report_in.XXXXXX" 2>/dev/null)" || tmp_in="$(mktemp 2>/dev/null)"
+    tmp_out="$(mktemp "${STATE_DIR}/_report_out.XXXXXX" 2>/dev/null)" || tmp_out="$(mktemp 2>/dev/null)"
+    if [[ -z "$tmp_in" || -z "$tmp_out" ]]; then
+        warn "无法创建临时文件，跳过 HTML 报告生成。"
+        return 0
+    fi
+    printf '%s\n' "$LOG_BUFFER" >"$tmp_in"
+
+    awk -v src_name="${REPORT_SRC_NAME:-$(basename "$REPORT_FILE")}" -v gen_time="$TS" '
+    # ---------- 工具：HTML 转义 ----------
+    # 先做整体替换（gsub 是整段字节替换，mawk 下对多字节字符安全），
+    # 避免逐字符 substr 在字节语义下既慢又可能踩坑。
+    function esc(s,   t) {
+        t = s
+        gsub(/&/, "\\&amp;", t)
+        gsub(/</, "\\&lt;", t)
+        gsub(/>/, "\\&gt;", t)
+        gsub(/"/, "\\&quot;", t)
+        return t
+    }
+    # 提取英文枚举词：  FAIL（失败） -> FAIL ；  N/A（不适用）-> N/A
+    function stripzh(s,   t) {
+        t = s
+        sub(/（.*$/, "", t)          # 去掉全角括号及之后
+        sub(/\(.*$/, "", t)          # 去掉半角括号及之后
+        gsub(/^[ \t]+|[ \t]+$/, "", t)
+        return t
+    }
+    function isunsup(pre, hdr) {
+        return (index(pre, "UNSUPPORTED") > 0) || (index(hdr, "UNSUPPORTED") > 0)
+    }
+
+    # 提取 "键 : 值"：只按 ASCII 冒号或全角冒号切分。
+    # 注意 mawk 按字节处理，全角字符不可放进 [] 字符类（会被拆成 3 个字节
+    # 各自匹配，导致半个字符残留）。这里对全角冒号改用 ".*：" 贪婪整段匹配，
+    # 只按字节序列整体定位，不做字符类匹配，字节安全。
+    function splitkv(s,   k, v) {
+        k = s; v = s
+        if (s ~ /:/) {
+            sub(/^[^:]*:/, "", v)
+            sub(/:.*$/, "", k)
+        } else if (index(s, "：") > 0) {
+            sub(/^.*：/, "", v)
+            sub(/：.*$/, "", k)
+        } else {
+            v = ""; k = s
+        }
+        gsub(/^[ \t]+|[ \t]+$/, "", v)
+        gsub(/^[ \t]+|[ \t]+$/, "", k)
+        KEY = k; VAL = v
+    }
+
+    # ---------- 第 1 遍：解析 ----------
+    {
+        ln = $0
+        # 报告头（首个测试项之前）。形如 "系统：Alpine Linux v3.19"。
+        if (cur == "" && (ln ~ /^(系统|OpenSSH|Profile|模式|端口|测试项|版本过滤)[ \t]*:/ || ln ~ /^(系统|OpenSSH|Profile|模式|端口|测试项|版本过滤)[ \t]*：/)) {
+            splitkv(ln)
+            hdr[KEY] = VAL
+        }
+        # [环境] 行
+        if (ln ~ /^\[环境\] /) {
+            body = substr(ln, length("[环境] ") + 1)
+            splitkv(body)
+            if (VAL != "") { envk[nEnvv] = KEY; envv[nEnvv] = VAL; nEnvv++ }
+        }
+        # 新测试项
+        if (ln ~ /^\[协商测试\] /) {
+            nItems++
+            cur = nItems
+            it_hdr[cur] = ln
+            next
+        }
+        # 字段行
+        if (cur > 0 && (ln ~ /^[^ \t].*[ \t]*:/ || ln ~ /^[^ \t].*：/)) {
+            # 只认已知字段名，避免把普通输出误当字段
+            splitkv(ln)
+            key = KEY; val = VAL
+            if (key ~ /^(测试项|测试组|协议|固定 协议|固定 密钥交换|固定 加密算法|固定 校验算法|固定 主机密钥|固定 压缩|实际 密钥交换|实际 加密算法|实际 校验算法|实际 主机密钥|实际 压缩|协商结果 NR|认证结果 AR|命令执行结果 ER|客户端进程 CPR|客户端诊断 CR|默认配置支持|服务端预筛|总体结果|原因)$/) {
+                f_val[cur, key] = val
+                f_seq[cur, f_n[cur]++] = key
+            }
+        }
+        # 汇总区非通过项
+        if (index(ln, "非通过（非 PASS）项一览") > 0) in_sum = 1
+        if (in_sum && ln ~ /^[ \t]*#[0-9]+[ \t]+/) {
+            t = ln
+            gsub(/^[ \t]+/, "", t)
+            split(t, b, /[ \t]+/)
+            np_no[nNp] = b[1]; np_res[nNp] = b[2]
+            r = b[3]; sub(/^[^ \t]+[ \t]+/, "", r)
+            # 去掉行首的组名,保留原因（若存在）
+            np_rest[nNp] = substr(t, index(t, b[3]))
+            nNp++
+        }
+    }
+
+    # ---------- 第 2 遍：统计（END 里做） ----------
+    END {
+        # ---- 分类 ----
+        for (i = 1; i <= nItems; i++) {
+            ov = stripzh(f_val[i, "总体结果"])
+            pre = f_val[i, "服务端预筛"]
+            unsup = isunsup(pre, it_hdr[i])
+            total++
+            if (unsup) { kind[i] = "na"; n_na++ }
+            else if (ov == "PASS") { kind[i] = "pass"; n_pass++; n_exec++ }
+            else if (ov == "FAIL") { kind[i] = "fail"; n_fail++ }
+            else if (ov == "WARN") { kind[i] = "warn"; n_warn++ }
+            else { kind[i] = "unknown"; n_unk++ }
+        }
+
+        # ---- CSS ----
+        printf "%s", "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n"
+        printf "%s", "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        printf "%s", "<title>SSH 算法协商测试报告</title>\n<style>\n"
+        printf "%s", ":root{--bg:#f6f7f9;--card:#fff;--ink:#1f2933;--muted:#6b7280;--line:#e3e6ea;"
+        printf "%s", "--pass:#137333;--pass-bg:#e6f4ea;--fail:#b3261e;--fail-bg:#fce8e6;"
+        printf "%s", "--na:#5f6368;--na-bg:#f1f3f4;--warn:#8a5a00;--warn-bg:#fef7e0;--accent:#1a73e8}\n"
+        printf "%s", "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);"
+        printf "%s", "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",\"PingFang SC\",\"Microsoft YaHei\",sans-serif;"
+        printf "%s", "font-size:14px;line-height:1.6}.wrap{max-width:1180px;margin:0 auto;padding:24px 18px 60px}\n"
+        printf "%s", "h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 10px;padding-left:10px;"
+        printf "%s", "border-left:3px solid var(--accent)}.sub{color:var(--muted);font-size:13px;margin-bottom:18px}\n"
+        printf "%s", ".card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px 18px;margin-bottom:14px}\n"
+        printf "%s", ".summary{display:flex;flex-wrap:wrap;gap:12px}.kpi{flex:1 1 150px;min-width:130px;background:#fff;"
+        printf "%s", "border:1px solid var(--line);border-radius:8px;padding:14px 16px}.kpi .num{font-size:26px;font-weight:700;line-height:1.2}\n"
+        printf "%s", ".kpi .lbl{font-size:12px;color:var(--muted);margin-top:4px}.kpi.pass .num{color:var(--pass)}"
+        printf "%s", ".kpi.fail .num{color:var(--fail)}.kpi.na .num{color:var(--na)}.kpi.warn .num{color:var(--warn)}\n"
+        printf "%s", ".verdict{margin-top:14px;padding:12px 16px;border-radius:8px;background:var(--pass-bg);color:var(--pass);"
+        printf "%s", "font-weight:600;font-size:15px}.verdict.bad{background:var(--fail-bg);color:var(--fail)}\n"
+        printf "%s", "table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px 10px;text-align:left;"
+        printf "%s", "border-bottom:1px solid var(--line);vertical-align:top}th{background:#fafbfc;color:var(--muted);"
+        printf "%s", "font-weight:600;white-space:nowrap}.badge{display:inline-block;padding:1px 8px;border-radius:10px;"
+        printf "%s", "font-size:12px;font-weight:600;white-space:nowrap}.b-pass{background:var(--pass-bg);color:var(--pass)}"
+        printf "%s", ".b-fail{background:var(--fail-bg);color:var(--fail)}.b-na{background:var(--na-bg);color:var(--na)}"
+        printf "%s", ".b-warn{background:var(--warn-bg);color:var(--warn)}\n"
+        printf "%s", ".toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}"
+        printf "%s", ".toolbar input[type=search]{flex:1 1 260px;padding:8px 12px;border:1px solid var(--line);border-radius:6px;font-size:14px}"
+        printf "%s", ".chip{cursor:pointer;user-select:none;padding:5px 12px;border:1px solid var(--line);border-radius:16px;"
+        printf "%s", "background:#fff;font-size:13px;color:var(--muted)}.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}\n"
+        printf "%s", "details{border:1px solid var(--line);border-radius:6px;margin-bottom:8px;background:#fff}"
+        printf "%s", "details>summary{cursor:pointer;padding:10px 14px;font-weight:600;list-style:none;display:flex;gap:10px;align-items:center}"
+        printf "%s", "details>summary::-webkit-details-marker{display:none}details>summary::before{content:\"▸\";color:var(--muted);transition:transform .15s}"
+        printf "%s", "details[open]>summary::before{transform:rotate(90deg)}details .body{padding:0 14px 12px;border-top:1px solid var(--line)}\n"
+        printf "%s", ".kv{display:grid;grid-template-columns:150px 1fr;gap:2px 14px;font-size:13px;padding:8px 0}"
+        printf "%s", ".kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-all}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
+        printf "%s", "pre.log{background:#0d1117;color:#c9d1d9;padding:12px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.5;max-height:360px}"
+        printf "%s", ".note{color:var(--muted);font-size:12px;margin-top:8px}"
+        printf "%s", "@media print{body{background:#fff}.wrap{max-width:none;padding:0}.toolbar{display:none}"
+        printf "%s", "details{break-inside:avoid}details>summary{background:#fafbfc}details[open] .body{display:block}}\n"
+        printf "%s", "</style>\n</head>\n<body>\n<div class=\"wrap\">\n"
+
+        # ---- 标题 ----
+        printf "<h1>SSH 算法协商测试报告</h1>\n"
+        printf "<div class=\"sub\">生成时间：%s · 来源：%s</div>\n", esc(gen_time), esc(src_name)
+
+        # ---- 摘要卡片 ----
+        printf "%s", "<div class=\"card\">\n<div class=\"summary\">\n"
+        printf "<div class=\"kpi\"><div class=\"num\">%d</div><div class=\"lbl\">总测试项</div></div>\n", total
+        printf "<div class=\"kpi pass\"><div class=\"num\">%d</div><div class=\"lbl\">通过 PASS</div></div>\n", n_pass
+        printf "<div class=\"kpi fail\"><div class=\"num\">%d</div><div class=\"lbl\">真失败 FAIL</div></div>\n", n_fail
+        printf "<div class=\"kpi na\"><div class=\"num\">%d</div><div class=\"lbl\">服务端不支持</div></div>\n", n_na
+        printf "<div class=\"kpi warn\"><div class=\"num\">%d</div><div class=\"lbl\">告警 WARN</div></div>\n", n_warn
+        printf "%s", "</div>\n"
+        if (n_fail == 0 && n_warn == 0) {
+            printf "<div class=\"verdict\">结论：服务器支持的 %d 个算法全部协商通过，无真失败项；另有 %d 个算法服务端本身不支持，属预期负结果。</div>\n", n_exec, n_na
+        } else {
+            printf "<div class=\"verdict bad\">结论：存在 %d 个真失败项", n_fail
+            if (n_warn > 0) printf "、%d 个告警项", n_warn
+            printf "，请重点查看下方「真失败/告警」分组。</div>\n"
+        }
+        printf "%s", "<div class=\"note\">说明：「真失败」= 服务端支持但协商/认证未通过，需要处理；"
+        printf "%s", "「服务端不支持」= 该算法服务端本就没有，属预期负结果。</div>\n</div>\n"
+
+        # ---- 环境信息 ----
+        printf "%s", "<h2>环境信息</h2>\n<div class=\"card\"><dl class=\"kv\">\n"
+        nk = split("系统|OpenSSH|Profile|模式|端口|测试项|版本过滤", hk, "|")
+        shown = 0
+        for (i = 1; i <= nk; i++) {
+            if (hk[i] in hdr) { printf "<dt>%s</dt><dd>%s</dd>\n", esc(hk[i]), esc(hdr[hk[i]]); shown++ }
+        }
+        # 精选 [环境] 行
+        for (i = 0; i < nEnvv; i++) {
+            full = "[环境] " envk[i]
+            if (full ~ /^\[环境\] (自动认证|sshd -T -f|临时公钥)/) continue
+            if (full ~ /^\[环境\] (配置备份|状态目录|Match 算法覆盖|sshd -Q|服务器过滤保留项数|初始服务状态|初始 crypto-policy)/) {
+                if (full in seen) continue
+                seen[full] = 1
+                printf "<dt>%s</dt><dd>%s</dd>\n", esc(full), esc(envv[i]); shown++
+            }
+        }
+        if (shown == 0) printf "%s", "<dt>（无）</dt><dd></dd>\n"
+        printf "%s", "</dl>\n"
+
+        # 诊断信息折叠
+        diag = 0; dtxt = ""
+        for (i = 0; i < nEnvv; i++) {
+            full = "[环境] " envk[i]
+            if (full ~ /^\[环境\] (自动认证|sshd -T -f|临时公钥)/) { diag++; dtxt = dtxt esc(full ": " envv[i]) "\n" }
+        }
+        if (diag > 0) {
+            printf "<details style=\"margin-top:10px\"><summary>诊断信息（%d 条：自动认证与 sshd -T 探针）</summary><pre class=\"log\">%s</pre></details>\n", diag, esc(dtxt)
+        }
+        printf "%s", "</div>\n"
+
+        # ---- 明细 ----
+        printf "%s", "<h2>明细</h2>\n<div class=\"toolbar\">\n"
+        printf "%s", "<input type=\"search\" id=\"q\" placeholder=\"搜索算法名 / 测试项 / 原因 …\">\n"
+        printf "<span class=\"chip\" data-k=\"pass\" onclick=\"toggleChip(this)\">通过 %d</span>\n", n_pass
+        printf "<span class=\"chip\" data-k=\"fail\" onclick=\"toggleChip(this)\">真失败 %d</span>\n", n_fail
+        printf "<span class=\"chip\" data-k=\"na\" onclick=\"toggleChip(this)\">不支持 %d</span>\n", n_na
+        printf "<span class=\"chip\" data-k=\"warn\" onclick=\"toggleChip(this)\">告警 %d</span>\n", n_warn
+        printf "%s", "<span class=\"chip\" onclick=\"toggleChip(this)\" data-k=\"__all\">显示全部</span>\n</div>\n"
+        printf "%s", "<div class=\"note\">点击左侧三角展开单项明细；上方输入框可实时筛选。</div>\n"
+
+        # 分组渲染：fail -> warn -> pass -> na -> unknown
+        rendergroup("★ 真失败项（需处理）", "fail")
+        rendergroup("★ 告警项（需人工确认）", "warn")
+        rendergroup("✓ 通过项", "pass")
+        rendergroup("○ 服务端不支持（预期负结果，通常无需处理）", "na")
+        rendergroup("? 未知项", "unknown")
+
+        # ---- JS ----
+        printf "%s", "<script>\n"
+        printf "%s", "function toggleChip(el){el.classList.toggle(\047on\047);applyFilter();}\n"
+        printf "%s", "function applyFilter(){var q=(document.getElementById(\047q\047).value||\047\047).toLowerCase();"
+        printf "%s", "var chips=[].slice.call(document.querySelectorAll(\047.chip.on\047)).map(function(c){return c.dataset.k;});"
+        printf "%s", "document.querySelectorAll(\047[data-row]\047).forEach(function(r){"
+        printf "%s", "var t=r.getAttribute(\047data-search\047)||\047\047;var k=r.getAttribute(\047data-kind\047)||\047\047;"
+        printf "%s", "var okQ=!q||t.indexOf(q)>=0;var okC=chips.length===0||chips.indexOf(k)>=0||chips.indexOf(\047__all\047)>=0;"
+        printf "%s", "r.style.display=(okQ&&okC)?\047\047:\047none\047;});}\n"
+        printf "%s", "document.addEventListener(\047DOMContentLoaded\047,function(){var q=document.getElementById(\047q\047);"
+        printf "%s", "if(q)q.addEventListener(\047input\047,applyFilter);});\n</script>\n</div>\n</body>\n</html>\n"
+    }
+
+    # 把测试项描述（desc）中的英文策略名/预筛标记翻译为中文，便于外行阅读。
+    # 只翻译"前缀套话"，算法名（kex=/cipher=/mac= 之后的值）保持原样（本就
+    # 是协议标准名，翻译反而不可检索）。例：
+    #   "组合(coverage-driven): kex=..."         -> "组合(覆盖驱动): kex=..."
+    #   "SERVER-FILTER UNSUPPORTED: kex=..."     -> "服务端预筛(不支持): kex=..."
+    function show_desc(s,   t) {
+        t = s
+        sub(/组合\(coverage-driven\)/,        "组合(覆盖驱动)", t)
+        sub(/OpenSSH8 X448 coverage-driven/,  "OpenSSH8 X448 覆盖驱动", t)
+        sub(/国密\/NORMAL coverage-driven/,   "国密\/NORMAL 覆盖驱动", t)
+        sub(/SERVER-FILTER UNSUPPORTED:/,     "服务端预筛(不支持):", t)
+        sub(/SERVER-FILTER UNKNOWN\/PRECHECK_ERROR:/, "服务端预筛(未知\/预检错误):", t)
+        return t
+    }
+
+    # 分组渲染函数（awk 内）。所有循环变量声明为局部，避免覆盖 END 中的 i/j。
+    function rendergroup(title, k,   cnt, ii, jj, no, desc, shown, kindname) {
+        cnt = 0
+        for (ii = 1; ii <= nItems; ii++) if (kind[ii] == k) cnt++
+        if (cnt == 0) return
+        printf "<h2>%s（%d 项）</h2>\n", title, cnt
+        for (ii = 1; ii <= nItems; ii++) {
+            if (kind[ii] != k) continue
+            no = f_val[ii, "测试项"]
+            shown = show_desc(no)
+            # data-search 同时收录中英两种写法，保证"覆盖驱动/coverage-driven"
+            # 两种关键词都能搜到；同时并入原因、算法名、测试组。
+            printf "<details data-row data-kind=\"%s\" data-search=\"%s\">", k, esc(tolower(no " " shown " " f_val[ii,"原因"] " " f_val[ii,"固定 加密算法"] " " f_val[ii,"实际 加密算法"] " " f_val[ii,"测试组"]))
+            # badge
+            if (k == "pass") kindname = "b-pass\">通过 PASS"
+            else if (k == "fail") kindname = "b-fail\">失败 FAIL"
+            else if (k == "na") kindname = "b-na\">不支持 N/A"
+            else if (k == "warn") kindname = "b-warn\">告警 WARN"
+            else kindname = "b-na\">未知 UNKNOWN"
+            printf "<summary><span class=\"badge %s</span> <span class=\"mono\">%s</span></summary>", kindname, esc(shown)
+            printf "%s", "<div class=\"body\"><dl class=\"kv\">"
+            split("固定 密钥交换|固定 加密算法|固定 校验算法|固定 主机密钥|固定 压缩|实际 密钥交换|实际 加密算法|实际 校验算法|实际 主机密钥|实际 压缩|协商结果 NR|认证结果 AR|命令执行结果 ER|客户端进程 CPR|客户端诊断 CR|默认配置支持|服务端预筛|总体结果|原因", fo, "|")
+            for (jj = 1; jj <= 19; jj++) {
+                if ((ii SUBSEP fo[jj]) in f_val) printf "<dt>%s</dt><dd class=\"mono\">%s</dd>", esc(fo[jj]), esc(f_val[ii, fo[jj]])
+            }
+            printf "%s", "</dl></div></details>\n"
+        }
+    }
+    ' "$tmp_in" >"$tmp_out" 2>/dev/null
+
+    if [[ -s "$tmp_out" ]]; then
+        chmod 600 "$tmp_out" 2>/dev/null || true
+        mv -f "$tmp_out" "$REPORT_FILE" 2>/dev/null || cp -f "$tmp_out" "$REPORT_FILE"
+        rm -f "$tmp_in" "$tmp_out" 2>/dev/null || true
+    else
+        warn "HTML 报告渲染失败（缓冲为空或解析异常），未生成报告文件。"
+        rm -f "$tmp_in" "$tmp_out" 2>/dev/null || true
+        return 0
+    fi
+    return 0
 }
 
 write_result() {
@@ -4128,9 +4496,20 @@ make_test_config_from_backup() {
                     none) printf '%s\n' 'Compression no' ;;
                 esac
             fi
-            local hostkey_file
+            local hostkey_file hostcert_file
             hostkey_file="$(hostkey_private_file "$hostkey" 2>/dev/null || printf '%s\n' /etc/ssh/ssh_host_rsa_key)"
             printf '%s\n' "HostKey $hostkey_file"
+            # 主机证书算法（*-cert-v01@openssh.com）光有 HostKeyAlgorithms 是
+            # 不够的：sshd 只在通过 HostCertificate 加载了证书文件后，才会在
+            # KEXINIT 中真正宣告 <alg>-cert 系列。缺这条指令时服务端 host key
+            # algorithms 会下发空列表，客户端报 "no matching host key type found"。
+            # 证书路径由 hostkey_certificate_required() 按 <私钥路径>-cert.pub 推导。
+            if [[ "$hostkey" == *-cert-v01@openssh.com ]]; then
+                hostcert_file="$(hostkey_certificate_required "$hostkey" 2>/dev/null || true)"
+                if [[ -n "$hostcert_file" && -f "$hostcert_file" ]]; then
+                    printf '%s\n' "HostCertificate $hostcert_file"
+                fi
+            fi
         fi
         printf '%s\n' '# --- END UNIFIED TEST OVERRIDES ---'
     } > "$tmp"
@@ -4141,7 +4520,7 @@ make_test_config_from_backup() {
         /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]+[Aa][Ll][Ll]([[:space:]]|$)/ { in_match=0; print; next }
         /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh]([[:space:]]|$)/ { in_match=1 }
         {
-            if ($0 ~ /^[[:space:]]*(Protocol|KexAlgorithms|Ciphers|Cipher|MACs|HostKeyAlgorithms|HostKey|Include)[[:space:]]+/ ||
+            if ($0 ~ /^[[:space:]]*(Protocol|KexAlgorithms|Ciphers|Cipher|MACs|HostKeyAlgorithms|HostKey|HostCertificate|Include)[[:space:]]+/ ||
                 (!in_match && $0 ~ /^[[:space:]]*(Port|ListenAddress|LogLevel|Compression)[[:space:]]+/)) {
                 print "# UNIFIED_TEST_COMMENTED: " $0
             } else {
@@ -4234,6 +4613,37 @@ run_auto_ssh2() {
         pubkey_opt="-o PubkeyAcceptedAlgorithms=+$hostkey"
     fi
 
+    # ★ 主机证书（*-cert-v01@openssh.com）的信任处理。
+    #
+    # 背景：主机证书与普通主机密钥的校验路径不同。服务端宣告 <alg>-cert 后，
+    # 客户端会去找"签发该证书的 CA"是否被本机信任（known_hosts 中的
+    # @cert-authority 记录）。若找不到，就报：
+    #     debug1: No matching CA found. Retry with plain key
+    # 注意这条报错**发生在密钥协商成功之后**——四/五维算法其实已经全部谈妥，
+    # 只是主机身份校验过不去，客户端随即回退重试并被判 NEGOTIATION_FAIL。
+    # 这会把一个"算法层面完全支持"的证书组合误记为失败。
+    #
+    # 解法：为证书项单独启用一个 known_hosts 文件，其中写入本机测试 CA 的
+    # @cert-authority 记录（CA 公钥由 al3补齐密钥材料.sh 生成在
+    # /etc/ssh/ca/host_ca.pub）。非证书项仍沿用 UserKnownHostsFile=/dev/null，
+    # 保持原有行为完全不变。
+    local kh_opt="-o UserKnownHostsFile=/dev/null"
+    local ca_file="${HOST_CA_PUB:-/etc/ssh/ca/host_ca.pub}"
+    if [[ "$hostkey" == *-cert-v01@openssh.com && -f "$ca_file" ]]; then
+        local kh_dir="$TMP_DIR/hostcert_kh"
+        mkdir -p "$kh_dir" 2>/dev/null || true
+        local kh_file="$kh_dir/known_hosts"
+        # @cert-authority 记录格式：@cert-authority <主机模式> <CA公钥>
+        # 用 "*" 覆盖所有主机名/地址，因为测试目标是 127.0.0.1 / localhost。
+        if [[ ! -s "$kh_file" ]]; then
+            printf '@cert-authority * %s\n' "$(cat "$ca_file" 2>/dev/null)" > "$kh_file" 2>/dev/null || true
+            chmod 600 "$kh_file" 2>/dev/null || true
+        fi
+        if [[ -s "$kh_file" ]]; then
+            kh_opt="-o UserKnownHostsFile=$kh_file"
+        fi
+    fi
+
     # KexAlgorithms 作为 ssh 客户端选项在 OpenSSH 5.4 才引入；
     # CentOS 6 的 OpenSSH 5.3 客户端不支持，传了会报 Bad configuration option。
     # 旧版本客户端不限制 KEX，服务端配置已经固定了 KEX，客户端会自动从
@@ -4251,7 +4661,7 @@ run_auto_ssh2() {
     ssh -vvv \
         -F /dev/null \
         -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
+        $kh_opt \
         -o ConnectTimeout=20 \
         -o ConnectionAttempts=1 \
         -o BatchMode=yes \
@@ -4278,8 +4688,6 @@ run_auto_ssh1() {
         identity_opt="-o IdentitiesOnly=yes"
     fi
 
-    # 用数组承载可选的 -C 参数，避免 $() 未加引号导致的 word splitting
-    # （SC2046）；直接加引号则会在不需要时传入空参数，故用数组最稳妥。
     #
     # 关键兼容性：本脚本开头启用了 `set -u`。在 **bash 4.1**（CentOS 6 自带
     # 4.1.2）下，对"已声明但为空"的数组用 `"${arr[@]}"` 展开会触发
@@ -4318,7 +4726,7 @@ load_supported_algorithms
     echo "[MAC]"; printf '%s\n' "$SUPPORTED_MAC"
     echo "[HOSTKEY]"; printf '%s\n' "$SUPPORTED_HOSTKEY"
     echo "---------------------------------------------"
-} | tee -a "$LOG_FILE"
+} | while IFS= read -r _pred_line; do log "$_pred_line"; done
 
 restore_after_test() {
     local reason="${1:-测试项结束恢复}"
@@ -5015,11 +5423,33 @@ test_one() {
             CR="PASS"
 
         else
+            # 服务端签名失败（典型：crypto-policy 禁用 SHA-1，OpenSSL 直接拒绝
+            # 用 ssh-rsa/SHA-1 签主机密钥）。
+            #
+            # 现象链条：客户端 KEX 选定了 <alg>，随后收到 KEX_ECDH_REPLY 时连接被
+            # 关闭；服务端日志出现
+            #     mm_answer_sign: sign: error in libcrypto
+            #     child_reap: preauth child ... exited with status 255
+            # 这不是"协商失败"（算法名已经谈拢），而是**服务端在签名阶段被底层
+            # 密码库拒绝**——即该算法在真实环境里确实不可用。
+            # 若不做此判定，这类项会落到 UNKNOWN/NEGOTIATED，既不是 PASS 也不是
+            # FAIL，掩盖了"该算法实际不可用"这个正确结论。
+            # 已知实例：AlmaLinux 9.8（OpenSSL 3.5.5 + DEFAULT 策略）上
+            # ssh-rsa / ssh-rsa-cert（SHA-1）必然触发。
+            if text_matches 'error in libcrypto|sign: error|mm_answer_sign' "$server_delta" 2>/dev/null || \
+               grep -qiE 'error in libcrypto|sign: error' "$client_out" 2>/dev/null; then
+
+                AR="FAIL"
+                CR="SERVER_SIGN_FAILED"
+                reason="服务端签名失败（底层密码库拒绝该签名算法，如 crypto-policy 禁用 SHA-1）：该算法在真实环境不可用"
+
             # 协商已经从客户端 DEBUG3 明确得到实际算法，但认证日志没有
             # 足够证据时不能擅自判 PASS/FAIL。
-            AR="UNKNOWN"
-            CR="NEGOTIATED"
-            reason="${reason:-协商已成功，但没有足够日志准确判断认证结果}"
+            else
+                AR="UNKNOWN"
+                CR="NEGOTIATED"
+                reason="${reason:-协商已成功，但没有足够日志准确判断认证结果}"
+            fi
         fi
     fi
 
@@ -5287,17 +5717,6 @@ log "计划覆盖（仅用于生成器决策）: 密钥交换=$(printf '%s\n' "$
 log "SSH-2 实际覆盖（仅成功协商结果）: 密钥交换=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^kex|//p' | paste -sd, -) 加密算法=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) 校验算法=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^mac|//p' | paste -sd, -) 主机密钥=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^hostkey|//p' | paste -sd, -) 压缩=$(printf '%s\n' "${!ACTUAL_SSH2_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
 log "SSH-1 实际覆盖（仅成功协商结果）: 加密算法=$(printf '%s\n' "${!ACTUAL_SSH1_COVERAGE_SEEN[@]}" | sed -n 's/^cipher|//p' | paste -sd, -) 压缩=$(printf '%s\n' "${!ACTUAL_SSH1_COVERAGE_SEEN[@]}" | sed -n 's/^compression|//p' | paste -sd, -)"
 
-# ------------------------------------------------------------
-# 人类可读摘要（结论区）
-#
-# 详细日志有上千行，且混杂大量过程性输出（[环境]/[恢复] 等）。人工翻阅时
-# 真正关心的其实只有三件事：
-#   1) 有没有"本该通过却失败"的真问题（NOT_RUN 不算，那是从未执行）；
-#   2) 有没有被静默降级的 WARN；
-#   3) 真实的通过率是多少（分母要剔除从未执行的项）。
-# 此处把这三件事单独打印在末尾，让报告可以不看中间直接读结论。
-# 详细数据仍在上面完整保留，不影响机器解析。
-# ------------------------------------------------------------
 {
     SUMMARY_REAL_FAIL=$(( FAIL - UNSUPPORTED_FAIL ))
     (( SUMMARY_REAL_FAIL < 0 )) && SUMMARY_REAL_FAIL=0
@@ -5387,10 +5806,10 @@ log "SSH-1 实际覆盖（仅成功协商结果）: 加密算法=$(printf '%s\n'
     printf '   从未执行项 : 字段 "命令执行结果 ER" 值为 NOT_RUN\n'
     printf ' （提示：本摘要区只是说明文字，统计以上面正文的字段值为准。）\n'
     printf '============================================================\n'
-} | tee -a "$LOG_FILE"
+} | while IFS= read -r _sum_line; do log "$_sum_line"; done
 
-
-log "结果与详细日志：$LOG_FILE"
+render_html_report
+log "报告文件（HTML）：$REPORT_FILE"
 log "============================================================"
 
 exit 0
