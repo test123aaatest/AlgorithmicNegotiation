@@ -35,11 +35,11 @@
 # 环境不属于以上任何一类时，脚本不会对系统做任何改动，只打印诊断信息并退出。
 #
 # 用法（四种模式，所有环境画像下都支持）：
-#   sudo ./test_ssh.sh                # 手动模式（默认，每项测试需手动触发/确认）
-#   sudo ./test_ssh.sh --auto          # 自动模式（本地回环客户端自动触发）
-#   sudo ./test_ssh.sh --list          # 只列出当前环境的测试项，不改动系统
-#   sudo ./test_ssh.sh --only=3        # 只运行编号为 3 的测试项（可与 --auto 组合）
-#   sudo ./test_ssh.sh --only=blowfish # 只运行描述包含 blowfish 的测试项
+#   sudo ./AlgorithmicNegotiation.sh                # 手动模式（默认，每项测试需手动触发/确认）
+#   sudo ./AlgorithmicNegotiation.sh --auto          # 自动模式（本地回环客户端自动触发）
+#   sudo ./AlgorithmicNegotiation.sh --list          # 只列出当前环境的测试项，不改动系统
+#   sudo ./AlgorithmicNegotiation.sh --only=3        # 只运行编号为 3 的测试项（可与 --auto 组合）
+#   sudo ./AlgorithmicNegotiation.sh --only=blowfish # 只运行描述包含 blowfish 的测试项
 #
 # 安全提示：
 #   - 运行期间会临时开启 PermitRootLogin yes / PasswordAuthentication yes。
@@ -84,11 +84,11 @@ STATE_ROOT="/var/lib/ssh-algo-unified"
 STATE_DIR="${STATE_ROOT}/${TS}_$$"
 LOCK_DIR="/var/run/ssh-algo-unified.lock"
 BACKUP_FILE="${STATE_DIR}/sshd_config.backup"
-AUTO_KEY="${BASE_DIR}/.algo_test_key.$$"
+AUTO_KEY="${BASE_DIR}/.algo_AlgorithmicNegotiation_key.$$"
 AUTO_PUB="${AUTO_KEY}.pub"
-AUTO_SSH1_KEY="${BASE_DIR}/.algo_test_ssh1_key.$$"
+AUTO_SSH1_KEY="${BASE_DIR}/.algo_AlgorithmicNegotiation1_key.$$"
 AUTO_SSH1_PUB="${AUTO_SSH1_KEY}.pub"
-AUTO_MARKER="algo-test-auto-key"
+AUTO_MARKER="algo-AlgorithmicNegotiation-auto-key"
 LOOPBACK_TARGET="root@127.0.0.1"
 # 默认端口 22；可用 --port= 覆盖
 PORT=22
@@ -484,8 +484,8 @@ for arg in "$@"; do
             # 取脚本自身的名字，避免重命名后帮助文案与实际不符。
             # $0 可能带路径（./x.sh、/a/b/x.sh）或被人为 fork 调用，
             # 故取 basename；取不到时回退到通用名。
-            SELF_NAME="$(basename -- "${0:-test_ssh.sh}" 2>/dev/null)"
-            [[ -n "$SELF_NAME" ]] || SELF_NAME="test_ssh.sh"
+            SELF_NAME="$(basename -- "${0:-AlgorithmicNegotiation.sh}" 2>/dev/null)"
+            [[ -n "$SELF_NAME" ]] || SELF_NAME="AlgorithmicNegotiation.sh"
             cat <<EOF
 用法: sudo ./${SELF_NAME} [选项]
 
@@ -2566,9 +2566,9 @@ backup_config() {
     TMP_DIR="$STATE_DIR"
     # 状态目录就绪后立即把日志迁入受保护目录（此前日志临时落在 BASE_DIR）。
     initialize_log_file
-    AUTO_KEY="${STATE_DIR}/algo_test_key"
+    AUTO_KEY="${STATE_DIR}/algo_AlgorithmicNegotiation_key"
     AUTO_PUB="${AUTO_KEY}.pub"
-    AUTO_SSH1_KEY="${STATE_DIR}/algo_test_ssh1_key"
+    AUTO_SSH1_KEY="${STATE_DIR}/algo_AlgorithmicNegotiation1_key"
     AUTO_SSH1_PUB="${AUTO_SSH1_KEY}.pub"
     cp -a "$SSHD_CONFIG" "$BACKUP_FILE" || die "无法备份 $SSHD_CONFIG"
     chmod 600 "$BACKUP_FILE" || true
