@@ -462,7 +462,11 @@ crypto_policy_relax_for_test() {
     return 1
 }
 
-for arg in "$@"; do
+# 参数解析采用 while + shift：这样遇到 "--port 22" 这类"值单独成参"的写法时，
+# 才能顺手消费掉下一个参数（for arg in "$@" 无法做到，会把 22 当成无关参数忽略
+# 并打警告）。--only 同理。
+while [[ $# -gt 0 ]]; do
+    arg="$1"
     case "$arg" in
         --auto)
             AUTO=true
@@ -473,12 +477,26 @@ for arg in "$@"; do
         --only=*)
             ONLY_FILTER="${arg#--only=}"
             ;;
-        --port=*)
-            PORT="${arg#--port=}"
-            if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
-                echo "错误：--port 必须是 1-65535 的纯数字（收到: '$PORT'）" >&2
+        --only)
+            # 兼容空格写法 "--only 3"；缺参时明确报错，不静默忽略。
+            if [[ $# -lt 2 ]]; then
+                echo "错误：--only 缺少参数（正确用法：--only=N 或 --only N）" >&2
                 exit 1
             fi
+            ONLY_FILTER="$2"
+            shift
+            ;;
+        --port=*)
+            PORT="${arg#--port=}"
+            ;;
+        --port)
+            # 兼容空格写法 "--port 22"；缺参时明确报错，不静默忽略。
+            if [[ $# -lt 2 ]]; then
+                echo "错误：--port 缺少参数（正确用法：--port=N 或 --port N）" >&2
+                exit 1
+            fi
+            PORT="$2"
+            shift
             ;;
         -h|--help)
             # 取脚本自身的名字，避免重命名后帮助文案与实际不符。
@@ -494,8 +512,11 @@ for arg in "$@"; do
   --auto             自动模式（本地回环客户端自动触发）
   --list             只列出当前环境的测试项，不改动系统
   --only=N           只运行编号为 N 的测试项（可与 --auto 组合）
+                     也支持空格写法：--only N
   --only=keyword     只运行描述包含 keyword 的测试项
+                     也支持空格写法：--only keyword
   --port=N           指定测试端口（默认 22）
+                     也支持空格写法：--port 22
   --allow-remote     允许 sshd 测试期间监听非回环地址（默认仅 127.0.0.1）
                      注意：测试会临时开启 PermitRootLogin/PasswordAuthentication，
                      放开监听范围意味着这些弱配置对外网可见，仅在隔离网络中使用。
@@ -510,7 +531,15 @@ EOF
             echo "警告：未识别参数 '$arg'，已忽略" >&2
             ;;
     esac
+    shift
 done
+
+# PORT 合法性统一校验。放在循环之后而非 case 内：因为 --port= 与 --port 两条
+# 分支都要走到这里，集中一处可避免漏改；校验时机仍在执行任何测试之前。
+if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    echo "错误：--port 必须是 1-65535 的纯数字（收到: '$PORT'）" >&2
+    exit 1
+fi
 
 if ! $LIST_ONLY && [[ $EUID -ne 0 ]]; then
     echo "错误：必须以 root 身份运行。"
