@@ -404,7 +404,6 @@ PasswordAuthentication yes
 | 文件 | 说明 |
 |---|---|
 | `AlgorithmicNegotiation.sh` | 主脚本（本 README 描述的对象） |
-| `结果文件说明书.md` | HTML 报告的逐字段解读与真实产物样例 |
 
 ---
 
