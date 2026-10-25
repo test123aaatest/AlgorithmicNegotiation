@@ -64,7 +64,9 @@ set -o pipefail
 # bash 4+ 关联数组（declare -A）检查
 (( BASH_VERSINFO[0] >= 4 )) || { echo "错误：需要 bash 4+（当前 ${BASH_VERSION}）。"; exit 1; }
 
-BASE_DIR="$(pwd)"
+# 脚本所在目录：报告与状态目录都落在它之下，避免污染 /var/lib 等系统目录。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$SCRIPT_DIR"
 TS="$(date +%Y%m%d_%H%M%S)"
 TMP_DIR="$BASE_DIR"
 
@@ -80,13 +82,16 @@ CRYPTO_POLICY_MODE="${CRYPTO_POLICY_MODE:-capability}"
 ONLY_FILTER=""
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
-STATE_ROOT="/var/lib/ssh-algo-unified"
+STATE_ROOT="${SCRIPT_DIR}/ssh-algo-unified"
 STATE_DIR="${STATE_ROOT}/${TS}_$$"
 LOCK_DIR="/var/run/ssh-algo-unified.lock"
 BACKUP_FILE="${STATE_DIR}/sshd_config.backup"
-AUTO_KEY="${BASE_DIR}/.algo_AlgorithmicNegotiation_key.$$"
+# 默认即指向 STATE_DIR（与 backup_config 内的重指向一致），确保临时密钥绝不落到
+# 当前目录/脚本所在目录；仅当 STATE_DIR 尚未创建前就被引用时才会用默认值，而此时
+# 脚本尚未开始任何写操作。backup_config 仍会再次显式赋值此处，保持单一事实来源。
+AUTO_KEY="${STATE_DIR}/algo_AlgorithmicNegotiation_key"
 AUTO_PUB="${AUTO_KEY}.pub"
-AUTO_SSH1_KEY="${BASE_DIR}/.algo_AlgorithmicNegotiation1_key.$$"
+AUTO_SSH1_KEY="${STATE_DIR}/algo_AlgorithmicNegotiation1_key"
 AUTO_SSH1_PUB="${AUTO_SSH1_KEY}.pub"
 AUTO_MARKER="algo-AlgorithmicNegotiation-auto-key"
 LOOPBACK_TARGET="root@127.0.0.1"
@@ -112,19 +117,30 @@ make_report_path() {
     printf '%s\n' "$candidate"
 }
 
-REPORT_FILE="$(make_report_path "$BASE_DIR")"
-# 回退：若 BASE_DIR 不可写（如 cd 到已删除目录），改用 /tmp。
-if ! ( set -o noclobber; : >"$REPORT_FILE" ) 2>/dev/null; then
-    REPORT_FILE="$(make_report_path /tmp)"
-    if ! ( set -o noclobber; : >"$REPORT_FILE" ) 2>/dev/null; then
-        echo "错误：无法创建报告文件（已尝试 ${BASE_DIR} 与 /tmp）" >&2
-        exit 1
+# 延迟创建报告文件：仅在真正需要写入时才创建并设置 0600 权限（见 ensure_report_file）。
+# 保留原 /tmp 回退逻辑；两处都失败才报错退出。幂等：已存在则仅补 chmod。
+# 这样 --list 等只读/提前退出的路径不会触碰磁盘，避免残留 0 字节占位文件
+# （原实现在启动时即创建，而 --list 在清理 trap 注册前就退出，占位文件无法被清理）。
+ensure_report_file() {
+    [[ -f "$REPORT_FILE" ]] && { chmod 600 "$REPORT_FILE" 2>/dev/null || true; return 0; }
+    if ( set -o noclobber; : >"$REPORT_FILE" ) 2>/dev/null; then
+        chmod 600 "$REPORT_FILE" || { echo "错误：无法设置报告文件权限：$REPORT_FILE" >&2; exit 1; }
+        return 0
     fi
-fi
-chmod 600 "$REPORT_FILE" || {
-    echo "错误：无法设置报告文件权限：$REPORT_FILE" >&2
+    # 回退：若 BASE_DIR 不可写（如 cd 到已删除目录），改用 /tmp。
+    local fallback
+    fallback="$(make_report_path /tmp)"
+    if ( set -o noclobber; : >"$fallback" ) 2>/dev/null; then
+        chmod 600 "$fallback" || { echo "错误：无法设置报告文件权限：$fallback" >&2; exit 1; }
+        REPORT_FILE="$fallback"
+        return 0
+    fi
+    echo "错误：无法创建报告文件（已尝试 ${BASE_DIR} 与 /tmp）" >&2
     exit 1
 }
+
+REPORT_FILE="$(make_report_path "$BASE_DIR")"
+# 延迟创建：报告文件不再在启动时预创建，而是真正需要落盘时（ensure_report_file）才创建。
 # 文本行缓冲（内存）：数百处 log 调用照旧追加到这里，不落任何 TXT。
 LOG_BUFFER=""
 
@@ -213,6 +229,9 @@ STATE_DIR_CREATED=false
 RESTORE_HELPER_PREEXISTING=false
 SYSTEMD_DROPIN_PREEXISTING=false
 CONFIG_RESTORED_CONFIRMED=false
+# 是否"被信号（INT/TERM）非正常终止"。正常退出保持 false；INT/TERM trap 置 true。
+# 仅当为 false（正常结束）时才卸载崩溃自愈钩子；被信号终止则保留钩子作开机兜底。
+UNSAFE_TERMINATION=false
 LOCK_ACQUIRED=false
 # 是否已开始改动宿主状态。仅在 backup_config 成功（备份已落盘）后置真。
 # EXIT trap 早于 backup_config 触发时（如抢锁失败、sshd_config 缺失导致 die），
@@ -558,44 +577,10 @@ log() {
 }
 
 initialize_log_file() {
-    # 报告最终落在受保护的状态目录下（0700 目录 + 0600 文件）。STATE_DIR 形如
-    # /var/lib/ssh-algo-unified/<TS>_<PID>，取其父目录 STATE_ROOT。
-    # 由于内容此时仍在内存缓冲（LOG_BUFFER），此处只做"迁移目标路径 + 目录权限"
-    # 的准备工作：若受保护目录可写，就把 REPORT_FILE 指过去；否则保留当前
-    # BASE_DIR 下的路径，避免只读运行目录导致脚本无法继续。
-    local log_dir="${STATE_DIR%/*}"
-    local prev_report="$REPORT_FILE"
-
-    # /var/lib/ssh-algo-unified 乃至 /var/lib）不受其约束。这里分层创建
-    # 并对每一层显式 chmod，避免中间目录以默认 umask 权限裸露。
-    local p _created=""
-    local IFS='/'
-    local acc=""
-    for p in $log_dir; do
-        [[ -n "$p" ]] || continue
-        acc="${acc:+$acc/}$p"
-        [[ -e "$acc" ]] && continue
-        mkdir "$acc" 2>/dev/null || break
-        _created="$acc"
-    done
-    [[ -n "$_created" ]] && chmod 700 "$_created" 2>/dev/null || true
-
-    if [[ -d "$log_dir" && -w "$log_dir" ]]; then
-        local new_report
-        new_report="$(make_report_path "$log_dir")"
-        if ( set -o noclobber; : >"$new_report" ) 2>/dev/null; then
-            if chmod 600 "$new_report" 2>/dev/null; then
-                [[ -n "$prev_report" && -f "$prev_report" ]] && rm -f "$prev_report" 2>/dev/null || true
-                REPORT_FILE="$new_report"
-                return 0
-            fi
-            rm -f "$new_report" 2>/dev/null || true
-        fi
-    fi
-
-    # 无法落到受保护目录时保留当前路径（BASE_DIR），而不是直接退出。
-    REPORT_FILE="$prev_report"
-    printf '%s\n' "[警告] 无法在受保护目录 $log_dir 创建报告，将继续使用当前目录：$REPORT_FILE" >&2
+    # 报告保留在脚本所在目录（BASE_DIR = SCRIPT_DIR），不迁移到 /var/lib 等系统目录。
+    # 内容在脚本结束时由 render_html_report 一次性写入同一个文件，全程不产生多余副本。
+    # 此处（真正进入测试、需要落盘前）才按需创建并设置 0600（见 ensure_report_file）。
+    ensure_report_file
     return 0
 }
 
@@ -2940,32 +2925,38 @@ restore_all() {
         done
         PREEXISTING_BACKUPS=()
 
-        # 删除本次运行创建的崩溃自愈钩子和 PID。
-        rm -f "$PID_FILE"
-        if [[ "$INIT" == "systemd" && "$SERVICE" != "unknown" ]]; then
-            if [[ -n "$SYSTEMD_DROPIN_FILE" &&
-                  -z "${PREEXISTING_PATH_SEEN[$SYSTEMD_DROPIN_FILE]:-}" &&
-                  "$SYSTEMD_DROPIN_PREEXISTING" != true ]]; then
-                rm -f "$SYSTEMD_DROPIN_FILE"
-            fi
-            if [[ -n "$SYSTEMD_DROPIN_DIR" ]]; then rmdir "$SYSTEMD_DROPIN_DIR" 2>/dev/null || true; fi
-            if [[ -z "${PREEXISTING_PATH_SEEN[$RESTORE_HELPER]:-}" &&
-                  "$RESTORE_HELPER_PREEXISTING" != true ]]; then
-                rm -f "$RESTORE_HELPER"
-            fi
-            systemctl daemon-reload >/dev/null 2>&1 || true
-        elif [[ "$INIT" == "sysv/service" ]] && command -v crontab >/dev/null 2>&1; then
-            local cron_now cron_tmp
-            cron_now="$(crontab -l 2>/dev/null || true)"
-            cron_tmp="$(mktemp "${TMP_DIR}/ssh-algo-unified-cron-clean.XXXXXX" 2>/dev/null || true)"
-            if [[ -n "$cron_tmp" ]]; then
-                printf '%s\n' "$cron_now" | grep -vF "$CRON_TAG" > "$cron_tmp" || true
-                crontab "$cron_tmp" 2>/dev/null || true
-                rm -f "$cron_tmp"
-            fi
-            if [[ -z "${PREEXISTING_PATH_SEEN[$RESTORE_HELPER]:-}" &&
-                  "$RESTORE_HELPER_PREEXISTING" != true ]]; then
-                rm -f "$RESTORE_HELPER"
+        # 删除本次运行创建的崩溃自愈钩子/PID —— 仅"程序正常结束"才清理。
+        # 被 INT/TERM 信号终止时不清钩子：保留恢复助手/drop-in/cron 作为开机兜底，
+        # 防止 sshd 万一停留在测试配置上导致开机后无法 SSH 登录。
+        if $UNSAFE_TERMINATION; then
+            log "[恢复] 检测到被信号终止（非正常结束）：保留崩溃自愈钩子（恢复助手/drop-in/cron）作为开机兜底。"
+        else
+            rm -f "$PID_FILE"
+            if [[ "$INIT" == "systemd" && "$SERVICE" != "unknown" ]]; then
+                if [[ -n "$SYSTEMD_DROPIN_FILE" &&
+                      -z "${PREEXISTING_PATH_SEEN[$SYSTEMD_DROPIN_FILE]:-}" &&
+                      "$SYSTEMD_DROPIN_PREEXISTING" != true ]]; then
+                    rm -f "$SYSTEMD_DROPIN_FILE"
+                fi
+                if [[ -n "$SYSTEMD_DROPIN_DIR" ]]; then rmdir "$SYSTEMD_DROPIN_DIR" 2>/dev/null || true; fi
+                if [[ -z "${PREEXISTING_PATH_SEEN[$RESTORE_HELPER]:-}" &&
+                      "$RESTORE_HELPER_PREEXISTING" != true ]]; then
+                    rm -f "$RESTORE_HELPER"
+                fi
+                systemctl daemon-reload >/dev/null 2>&1 || true
+            elif [[ "$INIT" == "sysv/service" ]] && command -v crontab >/dev/null 2>&1; then
+                local cron_now cron_tmp
+                cron_now="$(crontab -l 2>/dev/null || true)"
+                cron_tmp="$(mktemp "${TMP_DIR}/ssh-algo-unified-cron-clean.XXXXXX" 2>/dev/null || true)"
+                if [[ -n "$cron_tmp" ]]; then
+                    printf '%s\n' "$cron_now" | grep -vF "$CRON_TAG" > "$cron_tmp" || true
+                    crontab "$cron_tmp" 2>/dev/null || true
+                    rm -f "$cron_tmp"
+                fi
+                if [[ -z "${PREEXISTING_PATH_SEEN[$RESTORE_HELPER]:-}" &&
+                      "$RESTORE_HELPER_PREEXISTING" != true ]]; then
+                    rm -f "$RESTORE_HELPER"
+                fi
             fi
         fi
     else
@@ -3559,11 +3550,36 @@ EOF
 # 恢复钩子：INT/TERM 保留传统信号退出码（130/143）；EXIT 钩子根据
 # restore_all 的返回码决定最终退出码。restore_all 内部不再 exit，避免
 # 改写调用点已确定的退出码或与 EXIT trap 叠加递归。
-trap 'restore_all || true; exit 130' INT
-trap 'restore_all || true; exit 143' TERM
+# 退出前清理：若报告文件仍是 0 字节占位（渲染未完成即中断），则删除以免留下空文件。
+cleanup_report_placeholder() { [[ -f "${REPORT_FILE:-}" && ! -s "${REPORT_FILE:-}" ]] && rm -f "${REPORT_FILE:-}" 2>/dev/null || true; }
+# 运行期会在当前目录（脚本所在目录）下新建状态目录 STATE_ROOT；restore_all 已删除其中的
+# STATE_DIR，此处再移除空的顶层 STATE_ROOT，确保脚本结束后当前目录不留任何新建的目录残骸。
+# 若恢复失败，STATE_DIR 被保留用于排错，STATE_ROOT 非空，rmdir 自然失败（|| true）而保留。
+cleanup_state_root() {
+    # 不论正常结束还是被 INT/TERM 终止，都彻底删除运行期在当前目录新建的状态根目录
+    # （递归，含其中的临时密钥、配置备份、各 mktemp 探针文件、子目录）。确保最终当前
+    # 目录只留下脚本与 HTML 报告。该目录由本脚本新建、名字固定；且 restore_all 已先行
+    # 把 sshd 配置恢复回去，删除不影响系统安全。
+    [[ -d "${STATE_ROOT:-}" ]] && rm -rf -- "$STATE_ROOT" 2>/dev/null || true
+    # 双保险：清除当前目录（脚本所在目录）下可能残留的本脚本临时文件。仅匹配本脚本生成的
+    # 固定前缀——不会误删脚本本体 AlgorithmicNegotiation.sh（文件名不含上述前缀）。find 无
+    # 匹配也不报错，跨 shell 安全（规避 zsh 裸 glob 的 "no matches found" 中断问题）。
+    find "${BASE_DIR:-.}" -maxdepth 1 \( \
+        -name '.algo_AlgorithmicNegotiation*' -o \
+        -name 'algo_AlgorithmicNegotiation*' -o \
+        -name 'kexalgo_probe.*' -o \
+        -name 'ssh_algo_probe.*' -o \
+        -name 'ssh_algo_single.*' -o \
+        -name 'ssh1probe*' \
+    \) -delete 2>/dev/null || true
+    # 三保险：清理 /root/.ssh 下可能残留的授权准备临时文件（仅本脚本前缀）。
+    find /root/.ssh -maxdepth 1 -name 'authorized_keys.prepare.*' -delete 2>/dev/null || true
+}
+trap 'UNSAFE_TERMINATION=true; restore_all || true; cleanup_state_root; cleanup_report_placeholder; exit 130' INT
+trap 'UNSAFE_TERMINATION=true; restore_all || true; cleanup_state_root; cleanup_report_placeholder; exit 143' TERM
 # EXIT：保留调用点已确定的退出码；若 restore_all 报告恢复失败，则强制非零，
-# 保证"sshd 未完整恢复"时脚本不会以 0 退出。
-trap 'rc=$?; restore_all || rc=$RESTORE_EXIT_CODE; [[ "$rc" -eq 0 && "$RESTORE_EXIT_CODE" -ne 0 ]] && rc=$RESTORE_EXIT_CODE; exit "$rc"' EXIT
+# 保证"sshd 未完整恢复"时脚本不会以 0 退出。结束前清理可能残留的 0 字节报告占位。
+trap 'rc=$?; restore_all || rc=$RESTORE_EXIT_CODE; cleanup_state_root; cleanup_report_placeholder; [[ "$rc" -eq 0 && "$RESTORE_EXIT_CODE" -ne 0 ]] && rc=$RESTORE_EXIT_CODE; exit "$rc"' EXIT
 
 acquire_lock || exit 1
 
@@ -3726,6 +3742,8 @@ show_group() {
 #   3) 生成自包含 HTML（内嵌 CSS/JS，可搜索、可筛选、可折叠）。
 # ============================================================
 render_html_report() {
+    # 兜底：确保报告文件已创建（正常路径已由 initialize_log_file 创建）。
+    ensure_report_file
     local tmp_in tmp_out
     tmp_in="$(mktemp "${STATE_DIR}/_report_in.XXXXXX" 2>/dev/null)" || tmp_in="$(mktemp 2>/dev/null)"
     tmp_out="$(mktemp "${STATE_DIR}/_report_out.XXXXXX" 2>/dev/null)" || tmp_out="$(mktemp 2>/dev/null)"
